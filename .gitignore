@@ -1,0 +1,7 @@
+USE_INSECURE_SSL
+.gupiao_insecure_ssl
+USE_BYPASS_PROXY
+.gupiao_bypass_proxy
+__pycache__
+cache/
+.vscode/
