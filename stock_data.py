@@ -1,12 +1,22 @@
 import os
 import time
-from functools import lru_cache
+import re
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, TypeVar, Tuple
 from datetime import datetime, timedelta
 
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout as RequestsTimeout
+
+from stock_store import (
+    clear_history as clear_history_store,
+    clear_scan_snapshots,
+    clear_universe as clear_universe_store,
+    load_history as load_history_store,
+    load_universe as load_universe_store,
+    save_history as save_history_store,
+    save_universe as save_universe_store,
+)
 
 T = TypeVar("T")
 
@@ -125,80 +135,43 @@ _apply_network_patches()
 import akshare as ak
 import pandas as pd
 
-_UNIVERSE_CACHE_DIR = _project_root() / "cache"
-_UNIVERSE_CACHE_CSV = _UNIVERSE_CACHE_DIR / "a_share_universe.csv"
-_UNIVERSE_META_JSON = _UNIVERSE_CACHE_DIR / "universe_meta.json"
+def clear_universe_data() -> None:
+    """清空已保存的股票池和扫描快照。"""
+    clear_universe_store()
+    clear_scan_snapshots()
 
 
-def universe_cache_ttl_hours() -> float:
-    try:
-        return float(
-            os.environ.get("GUPPIAO_UNIVERSE_CACHE_HOURS", "168").strip() or "168"
-        )
-    except ValueError:
-        return 168.0
+def clear_history_data() -> None:
+    """清空已保存的历史日线。"""
+    clear_history_store()
 
 
-def clear_universe_disk_cache() -> None:
-    """删除本地股票池缓存；下次 get_all_stocks 会重新从交易所拉列表。"""
-    for p in (_UNIVERSE_CACHE_CSV, _UNIVERSE_META_JSON):
-        try:
-            if p.is_file():
-                p.unlink()
-        except OSError:
-            pass
-
-
-def _save_universe_cache(
+def _save_universe_store(
     df: pd.DataFrame, log: Optional[Callable[[str], None]] = None
 ) -> None:
     if df.empty or "code" not in df.columns:
         return
-    _UNIVERSE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    out = (
-        df[["code", "name"]].copy()
-        if "name" in df.columns
-        else df[["code"]].assign(name="")
-    )
-    out["code"] = out["code"].astype(str).str.strip().str.zfill(6)
-    out.to_csv(_UNIVERSE_CACHE_CSV, index=False, encoding="utf-8-sig")
-    import json
-
-    meta = {
-        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "count": int(len(out)),
-        "ttl_hours": universe_cache_ttl_hours(),
-    }
-    _UNIVERSE_META_JSON.write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    save_universe_store(df)
     if log:
-        log(f"股票池已缓存 {len(out)} 只 → cache/a_share_universe.csv")
+        log(f"股票池已保存 {len(df)} 只 → data/stock_store.sqlite3")
 
 
-def _load_universe_cache(
+def _load_universe_store(
     log: Optional[Callable[[str], None]] = None,
 ) -> Optional[pd.DataFrame]:
-    if not _UNIVERSE_CACHE_CSV.is_file():
-        return None
-    age_h = (time.time() - _UNIVERSE_CACHE_CSV.stat().st_mtime) / 3600
-    ttl = universe_cache_ttl_hours()
-    if age_h > ttl:
-        if log:
-            log(
-                f"股票池缓存已过期（{age_h:.1f}h > {ttl:.0f}h），将重新从交易所拉取…"
-            )
-        return None
-    try:
-        df = pd.read_csv(_UNIVERSE_CACHE_CSV, dtype={"code": str})
-    except Exception as e:
-        if log:
-            log(f"读取股票池缓存失败: {e}")
-        return None
-    if "code" not in df.columns:
+    df = load_universe_store()
+    if df is None or df.empty:
         return None
     if "name" not in df.columns:
         df["name"] = ""
+    if "exchange" not in df.columns:
+        df["exchange"] = df["code"].map(_infer_exchange)
+    if "board" not in df.columns:
+        df["board"] = df["code"].map(
+            lambda x: "???"
+            if str(x).strip().zfill(6).startswith("688")
+            else _infer_sz_board(x)
+        )
     df["code"] = (
         df["code"]
         .astype(str)
@@ -207,10 +180,37 @@ def _load_universe_cache(
         .str.zfill(6)
     )
     if log:
-        log(
-            f"已从本地加载股票池 {len(df)} 只（缓存约 {age_h:.1f}h 前，TTL {ttl:.0f}h）"
-        )
-    return df[["code", "name"]]
+        log(f"已从 data/stock_store.sqlite3 读取股票池 {len(df)} 只")
+    return df[["code", "name", "exchange", "board"]]
+
+
+def _load_history_store(
+    stock_code: str,
+    min_rows: int,
+    end_date: str,
+    log: Optional[Callable[[str], None]] = None,
+) -> Optional[pd.DataFrame]:
+    df = load_history_store(stock_code)
+    if df is None or df.empty or "date" not in df.columns or "close" not in df.columns:
+        return None
+    df["date"] = df["date"].astype(str).str.strip()
+    df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+    if len(df) < min_rows:
+        return None
+    if log:
+        log(f"已从 data/stock_store.sqlite3 读取历史 {stock_code} {len(df)} 行")
+    return df
+
+
+def _save_history_store(stock_code: str, df: pd.DataFrame, keep_rows: int = 40) -> None:
+    if df is None or df.empty:
+        return
+    if "date" not in df.columns:
+        return
+    out = df.copy()
+    out["date"] = out["date"].astype(str).str.strip()
+    out = out.sort_values("date").tail(max(keep_rows, 10)).reset_index(drop=True)
+    save_history_store(stock_code, out)
 
 
 def _eastmoney_request_mirror_urls(url: str) -> List[str]:
@@ -376,6 +376,20 @@ def _norm_code_series(s: pd.Series) -> pd.Series:
     )
 
 
+def _infer_sz_board(code: str) -> str:
+    c = str(code).strip().zfill(6)
+    if c.startswith(("300", "301")):
+        return "创业板"
+    if c.startswith(("000", "001", "002", "003")):
+        return "深交所主板"
+    return "深交所A股"
+
+
+def _infer_exchange(code: str) -> str:
+    c = str(code).strip().zfill(6)
+    return "上交所" if c.startswith(("5", "6", "9")) else "深交所"
+
+
 def _build_a_share_universe(log: Optional[Callable[[str], None]] = None) -> pd.DataFrame:
     """深交所 + 上交所（含科创板）官方列表，不含北交所；少量 HTTP，无东方财富 clist 分页。"""
     parts: List[pd.DataFrame] = []
@@ -384,19 +398,22 @@ def _build_a_share_universe(log: Optional[Callable[[str], None]] = None) -> pd.D
             "深交所 A 股",
             lambda: ak.stock_info_sz_name_code(symbol="A股列表"),
             {"A股代码": "code", "A股简称": "name"},
+            "深交所",
         ),
         (
             "上交所主板",
             lambda: ak.stock_info_sh_name_code(symbol="主板A股"),
             {"证券代码": "code", "证券简称": "name"},
+            "上交所",
         ),
         (
             "科创板",
             lambda: ak.stock_info_sh_name_code(symbol="科创板"),
             {"证券代码": "code", "证券简称": "name"},
+            "上交所",
         ),
     ]
-    for label, fetch, cmap in tasks:
+    for label, fetch, cmap, exchange in tasks:
         try:
             raw = _retry_ak_call(fetch)
             if raw is None or getattr(raw, "empty", True):
@@ -405,6 +422,13 @@ def _build_a_share_universe(log: Optional[Callable[[str], None]] = None) -> pd.D
                 continue
             d = raw.rename(columns=cmap)[["code", "name"]].copy()
             d["code"] = _norm_code_series(d["code"])
+            d["exchange"] = exchange
+            if label == "深交所 A 股":
+                d["board"] = d["code"].map(_infer_sz_board)
+            elif label == "上交所主板":
+                d["board"] = "上交所主板"
+            else:
+                d["board"] = "科创板"
             parts.append(d)
             if log:
                 log(f"{label}: {len(d)} 只")
@@ -412,103 +436,67 @@ def _build_a_share_universe(log: Optional[Callable[[str], None]] = None) -> pd.D
             if log:
                 log(f"{label} 失败: {e}（已跳过该段）")
     if not parts:
-        return pd.DataFrame(columns=["code", "name"])
+        return pd.DataFrame(columns=["code", "name", "exchange", "board"])
     out = pd.concat(parts, ignore_index=True)
     out = out.drop_duplicates(subset=["code"], keep="first").reset_index(drop=True)
     if log:
         log(f"合并去重后股票池共 {len(out)} 只。")
-    return out
+    return out[["code", "name", "exchange", "board"]]
 
-
-@lru_cache(maxsize=2048)
-def _cached_bid_ask_items(symbol: str) -> Tuple[Tuple[str, float], ...]:
-    sym = str(symbol).strip().zfill(6)
-    df = _retry_ak_call(ak.stock_bid_ask_em, symbol=sym)
-    m: Dict[str, float] = {}
-    for _, row in df.iterrows():
-        m[str(row["item"])] = _em_scalar(row["value"])
-    return tuple(sorted(m.items()))
-
-
-def _bid_ask_map(symbol: str) -> Dict[str, float]:
-    return dict(_cached_bid_ask_items(str(symbol).strip().zfill(6)))
-
-
-def clear_bid_ask_cache() -> None:
-    _cached_bid_ask_items.cache_clear()
-
-
-def _realtime_from_bid_ask(stock_code: str) -> Optional[Dict[str, Any]]:
-    try:
-        m = _bid_ask_map(stock_code)
-    except Exception:
-        return None
-    if not m:
-        return None
-    sym = str(stock_code).strip().zfill(6)
-    price = _em_price_yuan(m.get("最新"))
-    chg_pct = _em_scalar(m.get("涨幅"))
-    if abs(chg_pct) > 25:
-        chg_pct = chg_pct / 100.0
-    tr = _em_scalar(m.get("换手"))
-    if tr > 50:
-        tr = tr / 100.0
-    vr = _em_scalar(m.get("量比"))
-    if vr > 500:
-        vr = vr / 100.0
-    return {
-        "code": sym,
-        "name": "",
-        "price": price,
-        "change_pct": chg_pct,
-        "volume": _em_scalar(m.get("总手")),
-        "amount": _em_scalar(m.get("金额")),
-        "high": _em_price_yuan(m.get("最高")),
-        "low": _em_price_yuan(m.get("最低")),
-        "open": _em_price_yuan(m.get("今开")),
-        "pre_close": _em_price_yuan(m.get("昨收")),
-        "volume_ratio": vr,
-        "turnover_rate": tr,
-    }
-
-
-def _inner_outer_from_bid_ask(stock_code: str) -> Optional[Dict[str, Any]]:
-    try:
-        m = _bid_ask_map(stock_code)
-    except Exception:
-        return None
-    if not m:
-        return None
-    inner_vol = _em_scalar(m.get("内盘"))
-    outer_vol = _em_scalar(m.get("外盘"))
-    total_vol = inner_vol + outer_vol
-    inner_outer_ratio = outer_vol / inner_vol if inner_vol > 0 else 0.0
-    return {
-        "inner_volume": inner_vol,
-        "outer_volume": outer_vol,
-        "inner_outer_ratio": inner_outer_ratio,
-        "outer_pct": outer_vol / total_vol * 100 if total_vol > 0 else 0.0,
-        "inner_pct": inner_vol / total_vol * 100 if total_vol > 0 else 0.0,
-    }
 
 
 class StockDataFetcher:
     def __init__(self):
-        self.stock_list_cache = None
-        self.cache_time = None
-        self.cache_duration = 3600
         self._log: Optional[Callable[[str], None]] = None
+        self._strong_pool_cache: Dict[str, pd.DataFrame] = {}
 
     def set_log_callback(self, cb: Optional[Callable[[str], None]]) -> None:
         self._log = cb
 
-    def clear_quote_cache(self) -> None:
-        clear_bid_ask_cache()
 
-    def clear_saved_universe(self) -> None:
-        clear_universe_disk_cache()
+    def clear_saved_universe_data(self) -> None:
+        clear_universe_data()
 
-    def get_all_stocks(self, skip_cache: bool = False) -> pd.DataFrame:
+    def clear_history_data(self) -> None:
+        clear_history_data()
+
+    def _normalize_trade_date(self, trade_date: str) -> str:
+        return re.sub(r"\D", "", str(trade_date or ""))[:8]
+
+    def _load_strong_pool(self, trade_date: str) -> pd.DataFrame:
+        date_key = self._normalize_trade_date(trade_date)
+        if not date_key:
+            return pd.DataFrame()
+        cached = self._strong_pool_cache.get(date_key)
+        if cached is not None:
+            return cached
+        try:
+            df = _retry_ak_call(ak.stock_zt_pool_strong_em, date=date_key)
+        except Exception as e:
+            if self._log:
+                self._log(f"强势股池 {date_key} 获取失败: {e}")
+            df = pd.DataFrame()
+        self._strong_pool_cache[date_key] = df
+        return df
+
+    def get_limit_up_reason(self, stock_code: str, trade_date: str) -> str:
+        code = str(stock_code or "").strip().zfill(6)
+        if not code:
+            return ""
+        pool = self._load_strong_pool(trade_date)
+        if pool is None or pool.empty:
+            return ""
+        if "代码" not in pool.columns or "入选理由" not in pool.columns:
+            return ""
+        match = pool[pool["代码"].astype(str).str.strip().str.zfill(6) == code]
+        if match.empty:
+            return ""
+        reason = str(match.iloc[0].get("入选理由", "") or "").strip()
+        if not reason or reason.lower() == "nan":
+            return ""
+        return reason
+
+    def get_all_stocks(self, force_refresh: bool = False) -> pd.DataFrame:
         if _use_em_full_spot_for_list():
             return self._get_all_stocks_em_spot()
         if os.environ.get("GUPPIAO_REFRESH_UNIVERSE", "").strip().lower() in (
@@ -516,18 +504,18 @@ class StockDataFetcher:
             "true",
             "yes",
         ):
-            skip_cache = True
-        if not skip_cache:
-            cached = _load_universe_cache(self._log)
-            if cached is not None and not cached.empty:
-                return cached
+            force_refresh = True
+        if not force_refresh:
+            universe_df = _load_universe_store(self._log)
+            if universe_df is not None and not universe_df.empty:
+                return universe_df
         if self._log:
             self._log(
                 "从交易所构建股票池（深交所+上交所含科创板，不含北交所）…"
             )
         df = _build_a_share_universe(self._log)
         if not df.empty:
-            _save_universe_cache(df, self._log)
+            _save_universe_store(df, self._log)
         return df
 
     def _get_all_stocks_em_spot(self) -> pd.DataFrame:
@@ -558,6 +546,20 @@ class StockDataFetcher:
                 "总市值": "total_mv",
                 "流通市值": "circ_mv",
             })
+            if "code" in stock_list.columns:
+                stock_list["code"] = _norm_code_series(stock_list["code"])
+            if "code" in stock_list.columns:
+                stock_list["exchange"] = stock_list["code"].map(
+                    lambda x: "上交所"
+                    if str(x).startswith(("5", "6", "9"))
+                    else "深交所"
+                )
+                stock_list["board"] = stock_list["code"].map(
+                    lambda x: "科创板"
+                    if str(x).startswith("688")
+                    else _infer_sz_board(x)
+                )
+            save_universe_store(stock_list)
             if self._log:
                 self._log(f"东方财富全表下载完成，共 {len(stock_list)} 条。")
             return stock_list
@@ -569,35 +571,23 @@ class StockDataFetcher:
         finally:
             _list_download_log = prev_log
 
-    def get_realtime_data(self, stock_code: str) -> Optional[Dict[str, Any]]:
+    def get_history_data(
+        self,
+        stock_code: str,
+        days: int = 10,
+        force_refresh: bool = False,
+    ) -> Optional[pd.DataFrame]:
         try:
-            return _realtime_from_bid_ask(stock_code)
-        except Exception as e:
-            print(f"获取股票 {stock_code} 实时数据失败: {e}")
-            return None
-
-    def get_individual_flow(self, stock_code: str) -> Optional[Dict[str, Any]]:
-        try:
-            df = _retry_ak_call(ak.stock_individual_flow_em, stock=stock_code)
-            if df.empty:
-                return None
-            
-            latest = df.iloc[-1]
-            return {
-                'date': latest['日期'],
-                'main_net_inflow': float(latest['主力净流入-净额']) if latest['主力净流入-净额'] != '-' else 0,
-                'main_net_inflow_pct': float(latest['主力净流入-净占比']) if latest['主力净流入-净占比'] != '-' else 0,
-                'retail_net_inflow': float(latest['小单净流入-净额']) if latest['小单净流入-净额'] != '-' else 0,
-                'retail_net_inflow_pct': float(latest['小单净流入-净占比']) if latest['小单净流入-净占比'] != '-' else 0,
-            }
-        except Exception as e:
-            print(f"获取股票 {stock_code} 资金流向失败: {e}")
-            return None
-
-    def get_history_data(self, stock_code: str, days: int = 10) -> Optional[pd.DataFrame]:
-        try:
+            stock_code = str(stock_code).strip().zfill(6)
             end_date = datetime.now().strftime('%Y%m%d')
-            start_date = (datetime.now() - timedelta(days=days + 10)).strftime('%Y%m%d')
+            min_rows = max(1, days)
+
+            if not force_refresh:
+                history_df = _load_history_store(stock_code, min_rows, end_date, self._log)
+                if history_df is not None and not history_df.empty:
+                    return history_df.tail(days).reset_index(drop=True)
+
+            start_date = (datetime.now() - timedelta(days=days + 15)).strftime('%Y%m%d')
             
             df = _retry_ak_call(
                 ak.stock_zh_a_hist,
@@ -624,21 +614,28 @@ class StockDataFetcher:
                 '涨跌额': 'change_amount',
                 '换手率': 'turnover_rate'
             })
-            
-            return df.tail(days)
+            for col in [
+                "open",
+                "close",
+                "high",
+                "low",
+                "volume",
+                "amount",
+                "amplitude",
+                "change_pct",
+                "change_amount",
+                "turnover_rate",
+            ]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+            _save_history_store(stock_code, df, keep_rows=max(40, days + 10))
+            return df.tail(days).reset_index(drop=True)
         except Exception as e:
             print(f"获取股票 {stock_code} 历史数据失败: {e}")
             return None
 
-    def get_inner_outer_disk(self, stock_code: str) -> Optional[Dict[str, Any]]:
-        try:
-            return _inner_outer_from_bid_ask(stock_code)
-        except Exception as e:
-            print(f"获取股票 {stock_code} 内外盘数据失败: {e}")
-            return None
-
-    def get_stock_fund_flow_rank(self) -> Optional[pd.DataFrame]:
-        try:
             df = _retry_ak_call(ak.stock_fund_flow_individual, symbol="即时")
             return df
         except Exception as e:

@@ -4,9 +4,11 @@
 """
 import tkinter as tk
 from stock_gui import StockMonitorApp
+from stock_store import ensure_store_ready
 
 
 def main():
+    ensure_store_ready()
     root = tk.Tk()
     app = StockMonitorApp(root)
     root.mainloop()

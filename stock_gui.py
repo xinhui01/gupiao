@@ -1,372 +1,662 @@
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from __future__ import annotations
+
+import csv
+import json
 import threading
 from datetime import datetime
-from typing import List, Dict, Any
-from stock_filter import StockFilter
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
 import matplotlib
-matplotlib.use('TkAgg')
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
-plt.rcParams['axes.unicode_minus'] = False
+matplotlib.use("TkAgg")
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import tkinter as tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from tkinter import ttk, messagebox, scrolledtext
+
+from stock_filter import StockFilter
+from stock_data import clear_history_data, clear_universe_data
+from stock_store import ensure_store_ready, load_scan_snapshot, save_scan_snapshot
+
+plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "Arial Unicode MS"]
+plt.rcParams["axes.unicode_minus"] = False
 
 
 class StockMonitorApp:
     def __init__(self, root: tk.Tk):
+        ensure_store_ready()
         self.root = root
-        self.root.title("股票监控程序")
+        self.root.title("日终股票筛选器")
         self.root.geometry("1400x900")
         self.root.minsize(1200, 800)
-        
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
         self.stock_filter = StockFilter()
         self.stock_filter.set_log_callback(self._log_async)
+        self.all_scan_results: List[Dict[str, Any]] = []
         self.filtered_stocks: List[Dict[str, Any]] = []
+        self.sort_column = "five_day_return"
+        self.sort_reverse = True
         self.is_scanning = False
-        
+        self._run_log_file: Optional[Path] = None
+        self._current_scan_allowed_boards: List[str] = []
+        self._current_scan_max_stocks: int = 0
+
         self.setup_ui()
-        
+        self._load_last_results()
+
     def setup_ui(self):
         self.setup_menu()
-        
+
         main_frame = ttk.Frame(self.root, padding="5")
         main_frame.pack(fill=tk.BOTH, expand=True)
-        
+
         self.setup_control_panel(main_frame)
-        
         self.setup_notebook(main_frame)
-        
         self.setup_status_bar()
-        
+
     def setup_menu(self):
         menubar = tk.Menu(self.root)
         self.root.config(menu=menubar)
-        
+
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="文件", menu=file_menu)
         file_menu.add_command(label="导出结果", command=self.export_results)
         file_menu.add_separator()
-        file_menu.add_command(label="退出", command=self.root.quit)
-        
+        file_menu.add_command(label="退出", command=self.on_close)
+
         setting_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="设置", menu=setting_menu)
-        setting_menu.add_command(label="筛选条件", command=self.show_settings)
-        setting_menu.add_command(label="清除股票池本地缓存", command=self.on_clear_universe_cache)
-        
+        setting_menu.add_command(label="扫描参数", command=self.show_settings)
+        setting_menu.add_command(label="清空股票池", command=self.on_clear_universe_data)
+        setting_menu.add_command(label="清空历史数据", command=self.on_clear_history_data)
+
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="帮助", menu=help_menu)
         help_menu.add_command(label="关于", command=self.show_about)
-        
+
     def setup_control_panel(self, parent):
         control_frame = ttk.LabelFrame(parent, text="控制面板", padding="10")
         control_frame.pack(fill=tk.X, pady=5)
-        
+
         row1 = ttk.Frame(control_frame)
         row1.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(row1, text="量比阈值:").pack(side=tk.LEFT, padx=5)
-        self.volume_ratio_var = tk.StringVar(value="3.0")
-        ttk.Entry(row1, textvariable=self.volume_ratio_var, width=8).pack(side=tk.LEFT, padx=5)
-        
-        ttk.Label(row1, text="内外盘比阈值:").pack(side=tk.LEFT, padx=5)
-        self.inner_outer_var = tk.StringVar(value="1.0")
-        ttk.Entry(row1, textvariable=self.inner_outer_var, width=8).pack(side=tk.LEFT, padx=5)
-        
-        ttk.Label(row1, text="主力净流入(万):").pack(side=tk.LEFT, padx=5)
-        self.net_inflow_var = tk.StringVar(value="0")
-        ttk.Entry(row1, textvariable=self.net_inflow_var, width=10).pack(side=tk.LEFT, padx=5)
-        
-        ttk.Label(row1, text="连续天数(收盘>MA5):").pack(side=tk.LEFT, padx=5)
-        self.trend_days_var = tk.StringVar(value="5")
-        ttk.Entry(row1, textvariable=self.trend_days_var, width=5).pack(side=tk.LEFT, padx=5)
-        
-        ttk.Label(row1, text="扫描数量:").pack(side=tk.LEFT, padx=5)
-        self.scan_count_var = tk.StringVar(value="200")
+
+        ttk.Label(row1, text="扫描数量(0=全量):").pack(side=tk.LEFT, padx=5)
+        self.scan_count_var = tk.StringVar(value="0")
         ttk.Entry(row1, textvariable=self.scan_count_var, width=8).pack(side=tk.LEFT, padx=5)
+
         ttk.Label(row1, text="并发线程:").pack(side=tk.LEFT, padx=5)
         self.scan_workers_var = tk.StringVar(value="12")
-        ttk.Entry(row1, textvariable=self.scan_workers_var, width=5).pack(side=tk.LEFT, padx=5)
-        
-        row2 = ttk.Frame(control_frame)
-        row2.pack(fill=tk.X, pady=5)
-        
+        ttk.Entry(row1, textvariable=self.scan_workers_var, width=6).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(row1, text="连续天数:").pack(side=tk.LEFT, padx=5)
+        self.trend_days_var = tk.StringVar(value="5")
+        ttk.Entry(row1, textvariable=self.trend_days_var, width=6).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(row1, text="MA周期:").pack(side=tk.LEFT, padx=5)
+        self.ma_period_var = tk.StringVar(value="5")
+        ttk.Entry(row1, textvariable=self.ma_period_var, width=6).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(row1, text="近N日涨停:").pack(side=tk.LEFT, padx=5)
+        self.limit_up_lookback_var = tk.StringVar(value="5")
+        ttk.Entry(row1, textvariable=self.limit_up_lookback_var, width=6).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(row1, text="放量观察天数:").pack(side=tk.LEFT, padx=5)
+        self.volume_lookback_var = tk.StringVar(value="5")
+        ttk.Entry(row1, textvariable=self.volume_lookback_var, width=6).pack(side=tk.LEFT, padx=5)
+
+        self.volume_expand_enabled_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            row1,
+            text="启用放量倍数",
+            variable=self.volume_expand_enabled_var,
+        ).pack(side=tk.LEFT, padx=8)
+
+        ttk.Label(row1, text="放量倍数阈值:").pack(side=tk.LEFT, padx=5)
+        self.volume_expand_factor_var = tk.StringVar(value="2.0")
+        ttk.Entry(row1, textvariable=self.volume_expand_factor_var, width=6).pack(side=tk.LEFT, padx=5)
+
+        row1_note = ttk.Frame(control_frame)
+        row1_note.pack(fill=tk.X, pady=2)
+        ttk.Label(
+            row1_note,
+            text="备注：放量倍数=最近N天成交量最大值/最小值，勾选“启用放量倍数”后才参与筛选。",
+        ).pack(side=tk.LEFT, padx=5)
+
         self.refresh_universe_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            row2,
+            row1,
             text="重新拉取股票池",
             variable=self.refresh_universe_var,
-        ).pack(side=tk.LEFT, padx=10)
+        ).pack(side=tk.LEFT, padx=15)
 
-        ttk.Label(row2, text="价格范围:").pack(side=tk.LEFT, padx=5)
-        self.min_price_var = tk.StringVar(value="2.0")
-        ttk.Entry(row2, textvariable=self.min_price_var, width=8).pack(side=tk.LEFT, padx=5)
-        ttk.Label(row2, text="-").pack(side=tk.LEFT)
-        self.max_price_var = tk.StringVar(value="100.0")
-        ttk.Entry(row2, textvariable=self.max_price_var, width=8).pack(side=tk.LEFT, padx=5)
-        
+        row2 = ttk.Frame(control_frame)
+        row2.pack(fill=tk.X, pady=5)
+
         self.scan_btn = ttk.Button(row2, text="开始扫描", command=self.start_scan)
-        self.scan_btn.pack(side=tk.LEFT, padx=20)
-        
+        self.scan_btn.pack(side=tk.LEFT, padx=5)
+
         self.stop_btn = ttk.Button(row2, text="停止", command=self.stop_scan, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
-        
-        ttk.Label(row2, text="股票代码:").pack(side=tk.LEFT, padx=20)
+
+        ttk.Label(row2, text="股票代码:").pack(side=tk.LEFT, padx=5)
         self.stock_code_var = tk.StringVar()
         ttk.Entry(row2, textvariable=self.stock_code_var, width=10).pack(side=tk.LEFT, padx=5)
-        ttk.Button(row2, text="查询", command=self.query_single_stock).pack(side=tk.LEFT, padx=5)
-        
+        ttk.Button(row2, text="查询股票", command=self.query_single_stock).pack(side=tk.LEFT, padx=15)
+
+        row3 = ttk.Frame(control_frame)
+        row3.pack(fill=tk.X, pady=5)
+
+        ttk.Label(row3, text="显示板块:").pack(side=tk.LEFT, padx=5)
+        self.board_filter_vars = {
+            "上交所主板": tk.BooleanVar(value=True),
+            "深交所主板": tk.BooleanVar(value=True),
+            "创业板": tk.BooleanVar(value=True),
+            "科创板": tk.BooleanVar(value=True),
+        }
+        for label in ("上交所主板", "深交所主板", "创业板", "科创板"):
+            ttk.Checkbutton(
+                row3,
+                text=label,
+                variable=self.board_filter_vars[label],
+                command=self.on_board_filter_changed,
+            ).pack(side=tk.LEFT, padx=8)
+
+        self.require_limit_up_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            row3,
+            text="仅显示近N日内有涨停",
+            variable=self.require_limit_up_var,
+        ).pack(side=tk.LEFT, padx=18)
+
+        self.ignore_result_snapshot_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            row3,
+            text="忽略本地结果快照",
+            variable=self.ignore_result_snapshot_var,
+        ).pack(side=tk.LEFT, padx=18)
+
     def setup_notebook(self, parent):
         self.notebook = ttk.Notebook(parent)
         self.notebook.pack(fill=tk.BOTH, expand=True, pady=5)
-        
+
         self.setup_result_tab()
-        
         self.setup_detail_tab()
-        
         self.setup_log_tab()
-        
+
     def setup_result_tab(self):
         result_frame = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(result_frame, text="扫描结果")
-        
-        columns = ('代码', '名称', '现价', '涨跌幅', '量比', '内外盘比', '主力净流入(万)', '连续涨幅%')
-        self.result_tree = ttk.Treeview(result_frame, columns=columns, show='headings', height=20)
-        
-        col_widths = [80, 100, 80, 80, 80, 100, 120, 100]
-        for col, width in zip(columns, col_widths):
-            self.result_tree.heading(col, text=col)
+
+        columns = (
+            "code",
+            "name",
+            "board",
+            "latest_close",
+            "latest_ma",
+            "five_day_return",
+            "volume_expand_ratio",
+            "volume_expand",
+            "limit_up",
+            "limit_up_reason",
+            "recent_closes",
+            "summary",
+        )
+        self.result_tree = ttk.Treeview(result_frame, columns=columns, show="headings", height=20)
+
+        headings = {
+            "code": ("代码", 90),
+            "name": ("名称", 140),
+            "board": ("板块", 120),
+            "latest_close": ("最新收盘", 100),
+            "latest_ma": ("MA", 100),
+            "five_day_return": ("5日涨幅", 90),
+            "volume_expand_ratio": ("放量倍数", 90),
+            "volume_expand": ("放量", 70),
+            "limit_up": ("涨停", 70),
+            "limit_up_reason": ("涨停原因", 200),
+            "recent_closes": ("最近收盘", 220),
+            "summary": ("结果", 260),
+        }
+        for col in columns:
+            text, width = headings[col]
+            self.result_tree.heading(col, text=text, command=lambda c=col: self.on_result_heading_click(c))
             self.result_tree.column(col, width=width, anchor=tk.CENTER)
-        
+
         scrollbar = ttk.Scrollbar(result_frame, orient=tk.VERTICAL, command=self.result_tree.yview)
         self.result_tree.configure(yscrollcommand=scrollbar.set)
-        
+
         self.result_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        self.result_tree.bind('<<TreeviewSelect>>', self.on_stock_select)
-        self.result_tree.bind('<Double-1>', self.on_stock_double_click)
-        
+
+        self.result_tree.bind("<<TreeviewSelect>>", self.on_stock_select)
+        self.result_tree.bind("<Double-1>", self.on_stock_double_click)
+
     def setup_detail_tab(self):
         detail_frame = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(detail_frame, text="股票详情")
-        
-        info_frame = ttk.LabelFrame(detail_frame, text="基本信息", padding="10")
+
+        info_frame = ttk.LabelFrame(detail_frame, text="历史摘要", padding="10")
         info_frame.pack(fill=tk.X, pady=5)
-        
-        self.detail_labels = {}
-        detail_items = [
-            ('code', '股票代码:'), ('name', '股票名称:'), ('price', '当前价格:'),
-            ('change_pct', '涨跌幅:'), ('volume', '成交量:'), ('amount', '成交额:'),
-            ('volume_ratio', '量比:'), ('turnover_rate', '换手率:')
+
+        self.detail_labels: Dict[str, ttk.Label] = {}
+        items = [
+            ("code", "股票代码"),
+            ("name", "股票名称"),
+            ("latest_date", "最新日期"),
+            ("latest_close", "最新收盘"),
+            ("latest_ma", "MA"),
+            ("five_day_return", "5日涨幅"),
+            ("limit_up", "涨停"),
+            ("limit_up_reason", "涨停原因"),
+            ("volume_expand", "放量"),
+            ("volume_expand_ratio", "放量倍数"),
+            ("summary", "结论"),
         ]
-        
-        for i, (key, label) in enumerate(detail_items):
-            row = i // 4
-            col = (i % 4) * 2
-            ttk.Label(info_frame, text=label).grid(row=row, column=col, padx=5, pady=5, sticky=tk.E)
-            self.detail_labels[key] = ttk.Label(info_frame, text="-", width=15)
-            self.detail_labels[key].grid(row=row, column=col+1, padx=5, pady=5, sticky=tk.W)
-        
-        flow_frame = ttk.LabelFrame(detail_frame, text="资金流向", padding="10")
-        flow_frame.pack(fill=tk.X, pady=5)
-        
-        flow_items = [
-            ('main_net_inflow', '主力净流入:'), ('main_net_inflow_pct', '主力净占比:'),
-            ('retail_net_inflow', '散户净流入:'), ('retail_net_inflow_pct', '散户净占比:')
-        ]
-        
-        for i, (key, label) in enumerate(flow_items):
-            row = i // 4
-            col = (i % 4) * 2
-            ttk.Label(flow_frame, text=label).grid(row=row, column=col, padx=5, pady=5, sticky=tk.E)
-            self.detail_labels[key] = ttk.Label(flow_frame, text="-", width=15)
-            self.detail_labels[key].grid(row=row, column=col+1, padx=5, pady=5, sticky=tk.W)
-        
-        inner_outer_frame = ttk.LabelFrame(detail_frame, text="内外盘", padding="10")
-        inner_outer_frame.pack(fill=tk.X, pady=5)
-        
-        io_items = [
-            ('inner_volume', '内盘:'), ('outer_volume', '外盘:'),
-            ('inner_outer_ratio', '内外盘比:'), ('outer_pct', '外盘占比:')
-        ]
-        
-        for i, (key, label) in enumerate(io_items):
-            row = i // 4
-            col = (i % 4) * 2
-            ttk.Label(inner_outer_frame, text=label).grid(row=row, column=col, padx=5, pady=5, sticky=tk.E)
-            self.detail_labels[key] = ttk.Label(inner_outer_frame, text="-", width=15)
-            self.detail_labels[key].grid(row=row, column=col+1, padx=5, pady=5, sticky=tk.W)
-        
+
+        for i, (key, label) in enumerate(items):
+            row = i // 3
+            col = (i % 3) * 2
+            ttk.Label(info_frame, text=f"{label}:").grid(row=row, column=col, padx=5, pady=5, sticky=tk.E)
+            self.detail_labels[key] = ttk.Label(info_frame, text="-", width=30)
+            self.detail_labels[key].grid(row=row, column=col + 1, padx=5, pady=5, sticky=tk.W)
+
         chart_frame = ttk.LabelFrame(detail_frame, text="K线图", padding="5")
         chart_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
+
         self.fig, self.ax = plt.subplots(figsize=(10, 4))
         self.canvas = FigureCanvasTkAgg(self.fig, master=chart_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
+
     def setup_log_tab(self):
         log_frame = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(log_frame, text="运行日志")
-        
+
         self.log_text = scrolledtext.ScrolledText(log_frame, height=30, width=100)
         self.log_text.pack(fill=tk.BOTH, expand=True)
-        
+
     def setup_status_bar(self):
         self.status_var = tk.StringVar(value="就绪")
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-        
+
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(self.root, variable=self.progress_var, maximum=100)
         self.progress_bar.pack(side=tk.BOTTOM, fill=tk.X)
-        
-    def log(self, message: str):
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{ts}] {message}\n")
+
+    def _open_run_log(self) -> None:
+        log_dir = Path("data") / "run_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._run_log_file = log_dir / f"scan_{stamp}.log"
+        self._run_log_file.write_text("", encoding="utf-8")
+
+    def _close_run_log(self) -> None:
+        self._run_log_file = None
+
+    def _log(self, message: str) -> None:
+        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n"
+        self.log_text.insert(tk.END, line)
         self.log_text.see(tk.END)
-
-    def on_clear_universe_cache(self) -> None:
-        from stock_data import clear_universe_disk_cache
-
-        clear_universe_disk_cache()
-        self.log("已清除股票池本地缓存（cache/a_share_universe.csv），下次扫描将从交易所重新拉列表。")
+        if self._run_log_file is not None:
+            with self._run_log_file.open("a", encoding="utf-8") as f:
+                f.write(line)
 
     def _log_async(self, message: str) -> None:
-        """供后台线程调用，安全刷到「运行日志」页。"""
-        self.root.after(0, lambda m=message: self.log(m))
-        
-    def update_filter_params(self):
+        self.root.after(0, lambda: self._log(message))
+
+    def _selected_boards(self) -> List[str]:
+        boards = [board for board, var in self.board_filter_vars.items() if var.get()]
+        return boards or list(self.board_filter_vars.keys())
+
+    def _filter_results_by_selected_boards(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        allowed = {str(board).strip() for board in self._selected_boards() if str(board).strip()}
+        if not allowed:
+            return list(results)
+        filtered: List[Dict[str, Any]] = []
+        for item in results:
+            data = item.get("data", {}) or {}
+            code = str(item.get("code", "")).strip().zfill(6)
+            board = str(data.get("board") or "").strip()
+            if not board:
+                if code.startswith(("300", "301")):
+                    board = "创业板"
+                elif code.startswith("688"):
+                    board = "科创板"
+                elif code.startswith(("000", "001", "002", "003")):
+                    board = "深交所主板"
+                elif code.startswith(("5", "6", "9")):
+                    board = "上交所主板"
+                else:
+                    board = str(data.get("exchange") or "").strip()
+            if board in allowed:
+                filtered.append(item)
+        return filtered
+
+    def on_board_filter_changed(self):
+        if self.is_scanning:
+            return
+        source = self.all_scan_results or self.filtered_stocks
+        if not source:
+            return
+        filtered = self._filter_results_by_selected_boards(source)
+        self.update_result_table(filtered, announce=False, persist=False)
+        self.status_var.set(f"已按板块筛选，当前显示 {len(filtered)} 只")
+
+    def _scan_signature(self, allowed_boards: List[str], max_stocks: int) -> Dict[str, Any]:
+        return {
+            "trend_days": int(self.stock_filter.trend_days),
+            "ma_period": int(self.stock_filter.ma_period),
+            "limit_up_lookback_days": int(self.stock_filter.limit_up_lookback_days),
+            "volume_lookback_days": int(self.stock_filter.volume_lookback_days),
+            "volume_expand_enabled": bool(self.stock_filter.volume_expand_enabled),
+            "volume_expand_factor": float(self.stock_filter.volume_expand_factor),
+            "require_limit_up_within_days": bool(self.stock_filter.require_limit_up_within_days),
+            "allowed_boards": sorted({str(x).strip() for x in allowed_boards if str(x).strip()}),
+            "max_stocks": int(max_stocks),
+        }
+
+    def _save_last_results(self, results: List[Dict[str, Any]], complete: bool = True) -> None:
+        payload_results = []
+        for result in results:
+            data = result.get("data", {}) or {}
+            analysis = data.get("analysis") or {}
+            payload_results.append(
+                {
+                    "code": result.get("code", ""),
+                    "name": result.get("name", ""),
+                    "passed": bool(result.get("passed")),
+                    "reasons": result.get("reasons", []),
+                    "data": {
+                        "board": data.get("board", ""),
+                        "exchange": data.get("exchange", ""),
+                        "analysis": analysis,
+                    },
+                }
+            )
+        payload = {
+            "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "scan_date": datetime.now().strftime("%Y-%m-%d"),
+            "complete": bool(complete),
+            "row_count": len(payload_results),
+            "signature": self._scan_signature(self._current_scan_allowed_boards, self._current_scan_max_stocks),
+            "results": payload_results,
+        }
+        save_scan_snapshot(json.dumps(payload["signature"], ensure_ascii=False, sort_keys=True), payload)
+
+    def _load_last_results(self) -> None:
+        signature = self._scan_signature(self._selected_boards(), self._current_scan_max_stocks)
+        payload = load_scan_snapshot(json.dumps(signature, ensure_ascii=False, sort_keys=True))
+        if not payload:
+            return
+        results = payload.get("results", []) or []
+        if not results:
+            return
+        self.filtered_stocks = results
+        self.update_result_table(results, announce=False, persist=False)
+        self.status_var.set("已从本地结果恢复")
+
+    def _can_use_snapshot(self, allowed_boards: List[str], max_stocks: int) -> bool:
+        if self.ignore_result_snapshot_var.get():
+            return False
+        if self.refresh_universe_var.get():
+            return False
+        signature = self._scan_signature(allowed_boards, max_stocks)
+        payload = load_scan_snapshot(json.dumps(signature, ensure_ascii=False, sort_keys=True))
+        return bool(payload and payload.get("complete") and payload.get("results"))
+
+    def update_filter_params(self) -> bool:
         try:
-            self.stock_filter.min_volume_ratio = float(self.volume_ratio_var.get())
-            self.stock_filter.min_inner_outer_ratio = float(self.inner_outer_var.get())
-            self.stock_filter.min_main_net_inflow = float(self.net_inflow_var.get())
-            self.stock_filter.trend_days = int(self.trend_days_var.get())
-            self.stock_filter.min_price = float(self.min_price_var.get())
-            self.stock_filter.max_price = float(self.max_price_var.get())
+            self.stock_filter.trend_days = max(1, int(self.trend_days_var.get()))
+            self.stock_filter.ma_period = max(1, int(self.ma_period_var.get()))
+            self.stock_filter.limit_up_lookback_days = max(1, int(self.limit_up_lookback_var.get()))
+            self.stock_filter.volume_lookback_days = max(1, int(self.volume_lookback_var.get()))
+            self.stock_filter.volume_expand_enabled = bool(self.volume_expand_enabled_var.get())
+            self.stock_filter.volume_expand_factor = max(1.0, float(self.volume_expand_factor_var.get()))
+            self.stock_filter.require_limit_up_within_days = bool(self.require_limit_up_var.get())
             return True
         except ValueError:
-            messagebox.showerror("错误", "请输入有效的数值")
+            messagebox.showerror("错误", "参数无效")
             return False
-            
+
     def start_scan(self):
         if not self.update_filter_params():
             return
-            
-        self.is_scanning = True
-        self.scan_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
-        
-        for item in self.result_tree.get_children():
-            self.result_tree.delete(item)
-        self.filtered_stocks.clear()
-        
-        self.log("开始扫描股票…")
-        self.stock_filter.fetcher.clear_quote_cache()
-        self._log_async("已提交后台扫描线程，随后会显示各阶段进度。")
-        self.status_var.set("正在扫描...")
-        
-        scan_thread = threading.Thread(target=self.scan_stocks, daemon=True)
-        scan_thread.start()
-        
-    def stop_scan(self):
-        self.is_scanning = False
-        self.status_var.set("已停止")
-        
-    def scan_stocks(self):
-        self._log_async("扫描线程开始执行…")
+        if self.is_scanning:
+            return
+
         try:
             max_stocks = int(self.scan_count_var.get())
         except ValueError:
-            max_stocks = 200
-        try:
-            scan_workers = int(self.scan_workers_var.get())
-        except ValueError:
-            scan_workers = 12
-        scan_workers = max(1, min(scan_workers, 64))
-        self._log_async(
-            f"本次最多检测 {max_stocks} 只股票，并发线程 {scan_workers}（过大易被限流）。"
-        )
+            max_stocks = 0
+        allowed_boards = self._selected_boards()
+        self._current_scan_allowed_boards = allowed_boards
+        self._current_scan_max_stocks = max_stocks
 
-        def progress_callback(current, total, code, name):
-            if not self.is_scanning:
-                raise StopIteration
-            progress = (current / total) * 100
-            self.root.after(0, lambda: self.progress_var.set(progress))
-            self.root.after(0, lambda: self.status_var.set(f"扫描中: {current}/{total} - {code} {name}"))
-        
+        if self._can_use_snapshot(allowed_boards, max_stocks):
+            self._log("命中本地结果快照，直接恢复上次扫描结果。")
+            signature = json.dumps(self._scan_signature(allowed_boards, max_stocks), ensure_ascii=False, sort_keys=True)
+            payload = load_scan_snapshot(signature)
+            if payload:
+                self.all_scan_results = payload.get("results", []) or []
+                self.update_result_table(self.all_scan_results, announce=False, persist=False)
+                self.status_var.set("已从本地结果恢复")
+                self.progress_var.set(100)
+                self.scan_finished()
+                return
+
+        self.is_scanning = True
+        self.scan_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.all_scan_results.clear()
+        self.filtered_stocks.clear()
+        for item in self.result_tree.get_children():
+            self.result_tree.delete(item)
+
+        self._open_run_log()
+        self._log(
+            f"开始扫描：最近{self.stock_filter.trend_days}日收盘 > MA{self.stock_filter.ma_period}，"
+            f"近{self.stock_filter.limit_up_lookback_days}日内涨停过滤={'开' if self.stock_filter.require_limit_up_within_days else '关'}。"
+        )
+        self._log("扫描阶段只拉历史日线，不拉实时、资金流或内外盘。")
+        self.status_var.set("正在扫描...")
+        self.progress_var.set(0)
+
+        scan_thread = threading.Thread(target=self.scan_stocks, daemon=True)
+        scan_thread.start()
+
+    def stop_scan(self):
+        self.is_scanning = False
+        self.status_var.set("正在停止...")
+        self._log("已请求停止，正在等待当前任务结束。")
+
+    def scan_stocks(self):
         try:
+            try:
+                max_stocks = int(self.scan_count_var.get())
+            except ValueError:
+                max_stocks = 0
+            try:
+                scan_workers = int(self.scan_workers_var.get())
+            except ValueError:
+                scan_workers = 12
+            scan_workers = max(1, min(scan_workers, 16))
+
+            self._log_async(
+                f"扫描参数：数量={'全量' if max_stocks <= 0 else max_stocks}，并发线程={scan_workers}"
+            )
+
+            def progress_callback(current, total, code, name):
+                if not self.is_scanning:
+                    raise StopIteration
+                progress = (current / total) * 100 if total else 0
+                self.root.after(0, lambda: self.progress_var.set(progress))
+                self.root.after(0, lambda: self.status_var.set(f"扫描中 {current}/{total}: {code} {name}"))
+
             results = self.stock_filter.scan_all_stocks(
                 max_stocks=max_stocks,
                 progress_callback=progress_callback,
                 max_workers=scan_workers,
                 should_stop=lambda: not self.is_scanning,
                 refresh_universe=self.refresh_universe_var.get(),
+                allowed_boards=self._selected_boards(),
             )
-            self.filtered_stocks = results
+            self.all_scan_results = results
             self.root.after(0, lambda: self.update_result_table(results))
         except StopIteration:
-            self.root.after(0, lambda: self.log("扫描已停止"))
+            self.root.after(0, lambda: self._log("扫描已停止。"))
         except Exception as e:
-            self.root.after(0, lambda: self.log(f"扫描出错: {e}"))
+            self.root.after(0, lambda: self._log(f"扫描出错: {e}"))
         finally:
             self.root.after(0, self.scan_finished)
-            
-    def update_result_table(self, results: List[Dict[str, Any]]):
+
+    def _sort_value_for_column(self, item: Dict[str, Any], column: str):
+        data = item.get("data", {}) or {}
+        analysis = data.get("analysis") or {}
+
+        if column == "code":
+            return str(item.get("code", "")).zfill(6)
+        if column == "name":
+            return str(item.get("name", ""))
+        if column == "board":
+            return str(data.get("board") or data.get("exchange") or "")
+        if column == "latest_close":
+            value = analysis.get("latest_close")
+            return float(value) if value is not None else float("-inf")
+        if column == "latest_ma":
+            value = analysis.get("latest_ma")
+            return float(value) if value is not None else float("-inf")
+        if column == "five_day_return":
+            value = analysis.get("five_day_return")
+            return float(value) if value is not None else float("-inf")
+        if column == "volume_expand_ratio":
+            value = analysis.get("volume_expand_ratio")
+            return float(value) if value is not None else float("-inf")
+        if column == "volume_expand":
+            return 1 if analysis.get("volume_expand") else 0
+        if column == "limit_up":
+            return 1 if analysis.get("limit_up") else 0
+        if column == "limit_up_reason":
+            return str(analysis.get("limit_up_reason", ""))
+        if column == "recent_closes":
+            recent = analysis.get("recent_closes") or []
+            return tuple("" if v is None else f"{float(v):010.4f}" for v in recent)
+        if column == "summary":
+            return str(analysis.get("summary", item.get("reasons", [""])[0] if item.get("reasons") else ""))
+        latest_change_pct = analysis.get("latest_change_pct")
+        return float(latest_change_pct) if latest_change_pct is not None else float("-inf")
+
+    def _sort_results(
+        self,
+        results: List[Dict[str, Any]],
+        column: Optional[str] = None,
+        reverse: Optional[bool] = None,
+    ) -> List[Dict[str, Any]]:
+        sort_column = column or self.sort_column
+        sort_reverse = self.sort_reverse if reverse is None else bool(reverse)
+        secondary_columns = [
+            "volume_expand_ratio",
+            "limit_up",
+            "five_day_return",
+            "latest_change_pct",
+        ]
+        if sort_column in secondary_columns:
+            secondary_columns = [c for c in secondary_columns if c != sort_column]
+        return sorted(
+            results,
+            key=lambda item: tuple(
+                [self._sort_value_for_column(item, sort_column)]
+                + [self._sort_value_for_column(item, c) for c in secondary_columns]
+                + [str(item.get("code", ""))]
+            ),
+            reverse=sort_reverse,
+        )
+
+    def on_result_heading_click(self, column: str):
+        if column == self.sort_column:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_column = column
+            self.sort_reverse = column in {
+                "five_day_return",
+                "latest_close",
+                "latest_ma",
+                "volume_expand_ratio",
+                "limit_up",
+                "volume_expand",
+            }
+        if self.filtered_stocks:
+            self.update_result_table(self.filtered_stocks, announce=False, persist=False)
+
+    def update_result_table(
+        self,
+        results: List[Dict[str, Any]],
+        announce: bool = True,
+        persist: bool = True,
+    ):
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
-            
+
+        results = self._filter_results_by_selected_boards(results)
+        results = self._sort_results(results)
+
         for result in results:
-            data = result.get('data', {})
-            realtime = data.get('realtime') or {}
-            flow = data.get('flow') or {}
-            inner_outer = data.get('inner_outer') or {}
-            history = data.get('history')
-            
-            trend_change = 0
-            nd = self.stock_filter.trend_days
-            if history is not None and len(history) >= nd:
-                recent = history.tail(nd)
-                if 'change_pct' in recent.columns:
-                    trend_change = recent['change_pct'].sum()
-            
+            data = result.get("data", {}) or {}
+            analysis = data.get("analysis") or {}
+            recent = analysis.get("recent_closes") or []
+            recent_text = ", ".join("-" if v is None else f"{v:.2f}" for v in recent)
+            five_day_return = analysis.get("five_day_return")
+            volume_expand_ratio = analysis.get("volume_expand_ratio")
+            volume_expand = "是" if analysis.get("volume_expand") else "否"
+            limit_up = "是" if analysis.get("limit_up") else "否"
             values = (
-                result['code'],
-                realtime.get('name', '-'),
-                f"{realtime.get('price', 0):.2f}",
-                f"{realtime.get('change_pct', 0):.2f}%",
-                f"{realtime.get('volume_ratio', 0):.2f}",
-                f"{inner_outer.get('inner_outer_ratio', 0):.2f}",
-                f"{flow.get('main_net_inflow', 0):.2f}",
-                f"{trend_change:.2f}%"
+                result.get("code", "-"),
+                result.get("name", "-"),
+                data.get("board") or data.get("exchange") or "-",
+                "-" if analysis.get("latest_close") is None else f"{analysis['latest_close']:.2f}",
+                "-" if analysis.get("latest_ma") is None else f"{analysis['latest_ma']:.2f}",
+                "-" if five_day_return is None else f"{five_day_return:.2f}%",
+                "-" if volume_expand_ratio is None else f"{volume_expand_ratio:.2f}x",
+                volume_expand,
+                limit_up,
+                analysis.get("limit_up_reason", "-"),
+                recent_text,
+                analysis.get("summary", result.get("reasons", ["-"])[0] if result.get("reasons") else "-"),
             )
-            
-            self.result_tree.insert('', tk.END, values=values)
-            
-        self.log(f"扫描完成，找到 {len(results)} 只符合条件的股票")
-        
+            self.result_tree.insert("", tk.END, values=values)
+
+        self.filtered_stocks = results
+        if persist:
+            self._save_last_results(results, complete=True)
+        if announce:
+            self._log(f"扫描完成，命中 {len(results)} 只。")
+
     def scan_finished(self):
         self.scan_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-        self.progress_var.set(0)
         self.status_var.set("扫描完成")
         self.is_scanning = False
         self.refresh_universe_var.set(False)
-        
+        self._close_run_log()
+
     def on_stock_select(self, event):
         selection = self.result_tree.selection()
         if selection:
             item = self.result_tree.item(selection[0])
-            stock_code = item['values'][0]
+            stock_code = item["values"][0]
             self.show_stock_detail(stock_code)
-            
+
     def on_stock_double_click(self, event):
         selection = self.result_tree.selection()
         if selection:
             item = self.result_tree.item(selection[0])
-            stock_code = item['values'][0]
+            stock_code = item["values"][0]
             self.show_stock_detail(stock_code)
             self.notebook.select(1)
-            
+
     def query_single_stock(self):
         stock_code = self.stock_code_var.get().strip()
         if not stock_code:
@@ -374,154 +664,223 @@ class StockMonitorApp:
             return
         self.show_stock_detail(stock_code)
         self.notebook.select(1)
-        
+
     def show_stock_detail(self, stock_code: str):
-        self.log(f"查询股票 {stock_code} 详情...")
-        self.status_var.set(f"正在查询 {stock_code}...")
-        
-        detail_thread = threading.Thread(target=self._load_detail, args=(stock_code,), daemon=True)
+        code = str(stock_code).strip().zfill(6)
+        detail_payload = None
+        for result in self.filtered_stocks:
+            if str(result.get("code", "")).strip().zfill(6) == code:
+                data = result.get("data", {}) or {}
+                detail_payload = {
+                    "code": code,
+                    "name": result.get("name", ""),
+                    "board": data.get("board", ""),
+                    "exchange": data.get("exchange", ""),
+                    "history": data.get("history"),
+                    "analysis": data.get("analysis") or {},
+                }
+                break
+
+        if detail_payload is not None:
+            self._log(f"展示扫描结果中的股票 {code} 详情。")
+            self._update_detail_ui(detail_payload)
+            return
+
+        self._log(f"查询股票 {code} 的历史详情...")
+        self.status_var.set(f"正在查询 {code}...")
+        detail_thread = threading.Thread(target=self._load_detail, args=(code,), daemon=True)
         detail_thread.start()
-        
+
     def _load_detail(self, stock_code: str):
         try:
             detail = self.stock_filter.get_stock_detail(stock_code)
             self.root.after(0, lambda: self._update_detail_ui(detail))
         except Exception as e:
-            self.root.after(0, lambda: self.log(f"查询详情出错: {e}"))
+            self.root.after(0, lambda: self._log(f"查询详情出错: {e}"))
         finally:
             self.root.after(0, lambda: self.status_var.set("查询完成"))
-            
+
     def _update_detail_ui(self, detail: Dict[str, Any]):
-        realtime = detail.get('realtime') or {}
-        flow = detail.get('flow') or {}
-        inner_outer = detail.get('inner_outer') or {}
-        
-        self.detail_labels['code'].config(text=detail['code'])
-        self.detail_labels['name'].config(text=realtime.get('name', '-'))
-        self.detail_labels['price'].config(text=f"{realtime.get('price', 0):.2f}")
-        self.detail_labels['change_pct'].config(text=f"{realtime.get('change_pct', 0):.2f}%")
-        self.detail_labels['volume'].config(text=f"{realtime.get('volume', 0):.0f}")
-        self.detail_labels['amount'].config(text=f"{realtime.get('amount', 0):.2f}")
-        self.detail_labels['volume_ratio'].config(text=f"{realtime.get('volume_ratio', 0):.2f}")
-        self.detail_labels['turnover_rate'].config(text=f"{realtime.get('turnover_rate', 0):.2f}%")
-        
-        self.detail_labels['main_net_inflow'].config(text=f"{flow.get('main_net_inflow', 0):.2f}万")
-        self.detail_labels['main_net_inflow_pct'].config(text=f"{flow.get('main_net_inflow_pct', 0):.2f}%")
-        self.detail_labels['retail_net_inflow'].config(text=f"{flow.get('retail_net_inflow', 0):.2f}万")
-        self.detail_labels['retail_net_inflow_pct'].config(text=f"{flow.get('retail_net_inflow_pct', 0):.2f}%")
-        
-        self.detail_labels['inner_volume'].config(text=f"{inner_outer.get('inner_volume', 0):.0f}")
-        self.detail_labels['outer_volume'].config(text=f"{inner_outer.get('outer_volume', 0):.0f}")
-        self.detail_labels['inner_outer_ratio'].config(text=f"{inner_outer.get('inner_outer_ratio', 0):.2f}")
-        self.detail_labels['outer_pct'].config(text=f"{inner_outer.get('outer_pct', 0):.2f}%")
-        
-        self._draw_chart(detail.get('history'))
-        
-    def _draw_chart(self, history):
+        analysis = detail.get("analysis") or {}
+        history = detail.get("history")
+
+        self.detail_labels["code"].config(text=detail.get("code", "-"))
+        self.detail_labels["name"].config(text=detail.get("name", "-"))
+        self.detail_labels["latest_date"].config(text=analysis.get("latest_date", "-"))
+        self.detail_labels["latest_close"].config(
+            text="-" if analysis.get("latest_close") is None else f"{analysis['latest_close']:.2f}"
+        )
+        self.detail_labels["latest_ma"].config(
+            text="-" if analysis.get("latest_ma") is None else f"{analysis['latest_ma']:.2f}"
+        )
+        self.detail_labels["five_day_return"].config(
+            text="-" if analysis.get("five_day_return") is None else f"{analysis['five_day_return']:.2f}%"
+        )
+        self.detail_labels["limit_up"].config(text="是" if analysis.get("limit_up") else "否")
+        self.detail_labels["limit_up_reason"].config(text=analysis.get("limit_up_reason", "-"))
+        self.detail_labels["summary"].config(text=analysis.get("summary", "-"))
+
+        self._draw_chart(history, analysis)
+
+    def _draw_chart(self, history, analysis):
         self.ax.clear()
-        
-        if history is None or history.empty:
-            self.ax.text(0.5, 0.5, '暂无数据', ha='center', va='center', fontsize=14)
+
+        if history is None or getattr(history, "empty", True):
+            self.ax.text(0.5, 0.5, "暂无历史数据", ha="center", va="center", fontsize=14)
             self.canvas.draw()
             return
-            
-        dates = history['date'].values if 'date' in history.columns else range(len(history))
-        closes = history['close'].values if 'close' in history.columns else []
-        
-        self.ax.plot(dates, closes, 'b-', linewidth=1.5, label='收盘价')
-        
-        if 'high' in history.columns and 'low' in history.columns:
-            self.ax.fill_between(dates, history['low'].values, history['high'].values, alpha=0.3, label='波动区间')
-        
-        self.ax.set_xlabel('日期')
-        self.ax.set_ylabel('价格')
-        self.ax.set_title('近期走势')
+
+        df = history.copy()
+        dates = df["date"].astype(str).values if "date" in df.columns else range(len(df))
+        closes = df["close"].values if "close" in df.columns else []
+
+        self.ax.plot(dates, closes, "b-", linewidth=1.5, label="收盘价")
+
+        if "close" in df.columns:
+            ma_period = max(1, int(self.stock_filter.ma_period))
+            ma = pd.Series(df["close"]).rolling(window=ma_period, min_periods=ma_period).mean().values
+            self.ax.plot(dates, ma, "r--", linewidth=1.2, label=f"MA{ma_period}")
+
+        self.ax.set_xlabel("日期")
+        self.ax.set_ylabel("价格")
+        self.ax.set_title("最近走势")
         self.ax.legend()
         self.ax.grid(True, alpha=0.3)
-        
-        self.ax.tick_params(axis='x', rotation=45)
-        
+        self.ax.tick_params(axis="x", rotation=45)
+
         self.fig.tight_layout()
         self.canvas.draw()
-        
+
     def export_results(self):
         if not self.filtered_stocks:
             messagebox.showwarning("警告", "没有可导出的结果")
             return
-            
+
         from tkinter import filedialog
-        import csv
-        
+
         file_path = filedialog.asksaveasfilename(
             defaultextension=".csv",
-            filetypes=[("CSV文件", "*.csv"), ("所有文件", "*.*")]
+            filetypes=[("CSV文件", "*.csv"), ("所有文件", "*.*")],
         )
-        
-        if file_path:
-            try:
-                with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(['代码', '名称', '现价', '涨跌幅', '量比', '内外盘比', '主力净流入(万)', '连续涨幅%'])
-                    
-                    for result in self.filtered_stocks:
-                        data = result.get('data', {})
-                        realtime = data.get('realtime') or {}
-                        flow = data.get('flow') or {}
-                        inner_outer = data.get('inner_outer') or {}
-                        history = data.get('history')
-                        
-                        trend_change = 0
-                        nd = self.stock_filter.trend_days
-                        if history is not None and len(history) >= nd:
-                            recent = history.tail(nd)
-                            if 'change_pct' in recent.columns:
-                                trend_change = recent['change_pct'].sum()
-                        
-                        writer.writerow([
-                            result['code'],
-                            realtime.get('name', '-'),
-                            f"{realtime.get('price', 0):.2f}",
-                            f"{realtime.get('change_pct', 0):.2f}%",
-                            f"{realtime.get('volume_ratio', 0):.2f}",
-                            f"{inner_outer.get('inner_outer_ratio', 0):.2f}",
-                            f"{flow.get('main_net_inflow', 0):.2f}",
-                            f"{trend_change:.2f}%"
-                        ])
-                        
-                messagebox.showinfo("成功", f"结果已导出到 {file_path}")
-                self.log(f"结果已导出到 {file_path}")
-            except Exception as e:
-                messagebox.showerror("错误", f"导出失败: {e}")
-                
+
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["代码", "名称", "板块", "最新日期", "最新收盘", "MA", "5日涨幅", "放量倍数", "放量", "涨停", "涨停原因", "最近收盘", "结论"])
+                for result in self.filtered_stocks:
+                    data = result.get("data", {}) or {}
+                    analysis = data.get("analysis") or {}
+                    recent = analysis.get("recent_closes") or []
+                    writer.writerow(
+                        [
+                            result.get("code", ""),
+                            result.get("name", ""),
+                            data.get("board", data.get("exchange", "")),
+                            analysis.get("latest_date", ""),
+                            "" if analysis.get("latest_close") is None else f"{analysis['latest_close']:.2f}",
+                            "" if analysis.get("latest_ma") is None else f"{analysis['latest_ma']:.2f}",
+                            "" if analysis.get("five_day_return") is None else f"{analysis['five_day_return']:.2f}%",
+                            "" if analysis.get("volume_expand_ratio") is None else f"{analysis['volume_expand_ratio']:.2f}x",
+                            "是" if analysis.get("volume_expand") else "否",
+                            "是" if analysis.get("limit_up") else "否",
+                            analysis.get("limit_up_reason", ""),
+                            ", ".join("" if v is None else f"{v:.2f}" for v in recent),
+                            analysis.get("summary", ""),
+                        ]
+                    )
+            messagebox.showinfo("成功", f"结果已导出到 {file_path}")
+            self._log(f"结果已导出到 {file_path}")
+        except Exception as e:
+            messagebox.showerror("错误", f"导出失败: {e}")
+
     def show_settings(self):
         settings_window = tk.Toplevel(self.root)
-        settings_window.title("筛选条件设置")
-        settings_window.geometry("400x300")
+        settings_window.title("扫描参数")
+        settings_window.geometry("520x340")
         settings_window.transient(self.root)
         settings_window.grab_set()
-        
+
         frame = ttk.Frame(settings_window, padding="20")
         frame.pack(fill=tk.BOTH, expand=True)
-        
-        ttk.Label(frame, text="量比阈值:").grid(row=0, column=0, sticky=tk.E, pady=5)
-        ttk.Entry(frame, textvariable=self.volume_ratio_var, width=15).grid(row=0, column=1, pady=5)
-        
-        ttk.Label(frame, text="内外盘比阈值:").grid(row=1, column=0, sticky=tk.E, pady=5)
-        ttk.Entry(frame, textvariable=self.inner_outer_var, width=15).grid(row=1, column=1, pady=5)
-        
-        ttk.Label(frame, text="主力净流入(万):").grid(row=2, column=0, sticky=tk.E, pady=5)
-        ttk.Entry(frame, textvariable=self.net_inflow_var, width=15).grid(row=2, column=1, pady=5)
-        
-        ttk.Label(frame, text="连续天数(收盘>MA5):").grid(row=3, column=0, sticky=tk.E, pady=5)
-        ttk.Entry(frame, textvariable=self.trend_days_var, width=15).grid(row=3, column=1, pady=5)
-        
-        ttk.Label(frame, text="最低价格:").grid(row=4, column=0, sticky=tk.E, pady=5)
-        ttk.Entry(frame, textvariable=self.min_price_var, width=15).grid(row=4, column=1, pady=5)
-        
-        ttk.Label(frame, text="最高价格:").grid(row=5, column=0, sticky=tk.E, pady=5)
-        ttk.Entry(frame, textvariable=self.max_price_var, width=15).grid(row=5, column=1, pady=5)
-        
-        ttk.Button(frame, text="保存", command=lambda: [self.update_filter_params(), settings_window.destroy()]).grid(row=6, column=0, columnspan=2, pady=20)
-        
+
+        ttk.Label(frame, text="扫描数量(0=全量):").grid(row=0, column=0, sticky=tk.E, pady=8)
+        ttk.Entry(frame, textvariable=self.scan_count_var, width=15).grid(row=0, column=1, pady=8)
+
+        ttk.Label(frame, text="并发线程:").grid(row=1, column=0, sticky=tk.E, pady=8)
+        ttk.Entry(frame, textvariable=self.scan_workers_var, width=15).grid(row=1, column=1, pady=8)
+
+        ttk.Label(frame, text="连续天数:").grid(row=2, column=0, sticky=tk.E, pady=8)
+        ttk.Entry(frame, textvariable=self.trend_days_var, width=15).grid(row=2, column=1, pady=8)
+
+        ttk.Label(frame, text="MA周期:").grid(row=3, column=0, sticky=tk.E, pady=8)
+        ttk.Entry(frame, textvariable=self.ma_period_var, width=15).grid(row=3, column=1, pady=8)
+
+        ttk.Label(frame, text="近N日涨停:").grid(row=4, column=0, sticky=tk.E, pady=8)
+        ttk.Entry(frame, textvariable=self.limit_up_lookback_var, width=15).grid(row=4, column=1, pady=8)
+
+        ttk.Label(frame, text="放量观察天数:").grid(row=5, column=0, sticky=tk.E, pady=8)
+        ttk.Entry(frame, textvariable=self.volume_lookback_var, width=15).grid(row=5, column=1, pady=8)
+
+        ttk.Checkbutton(frame, text="启用放量倍数", variable=self.volume_expand_enabled_var).grid(
+            row=6, column=0, columnspan=2, pady=8
+        )
+
+        ttk.Label(frame, text="放量倍数阈值:").grid(row=7, column=0, sticky=tk.E, pady=8)
+        ttk.Entry(frame, textvariable=self.volume_expand_factor_var, width=15).grid(row=7, column=1, pady=8)
+
+        ttk.Label(frame, text="备注：放量倍数=最近N天最大成交量/最小成交量").grid(
+            row=8, column=0, columnspan=2, pady=8
+        )
+
+        ttk.Checkbutton(frame, text="仅显示近N日内有涨停", variable=self.require_limit_up_var).grid(
+            row=9, column=0, columnspan=2, pady=8
+        )
+
+        ttk.Checkbutton(frame, text="重新拉取股票池", variable=self.refresh_universe_var).grid(
+            row=10, column=0, columnspan=2, pady=8
+        )
+
+        ttk.Button(frame, text="保存", command=lambda: settings_window.destroy()).grid(
+            row=11, column=0, columnspan=2, pady=18
+        )
+
     def show_about(self):
-        messagebox.showinfo("关于", "股票监控程序 v1.0\n\n功能:\n- 根据量比、内外盘比等筛选股票\n- 连续N日收盘站上MA5（默认5日）\n- 可视化K线图\n\n数据来源: akshare")
+        messagebox.showinfo(
+            "关于",
+            "日终股票筛选器\n\n"
+            "功能:\n"
+            "- 只使用历史日线数据\n"
+            "- 筛选最近N日收盘全部高于MA\n"
+            "- 可过滤近N日内出现过涨停的股票\n"
+            "- 结果和历史数据都会保存到 data/stock_store.sqlite3\n",
+        )
+
+    def on_clear_universe_data(self):
+        clear_universe_data()
+        self._log("已清空股票池和结果快照。")
+
+    def on_clear_history_data(self):
+        clear_history_data()
+        self._log("已清空历史数据。")
+
+    def on_close(self):
+        self.is_scanning = False
+        self._close_run_log()
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except Exception:
+            pass
+
+
+def run_app():
+    root = tk.Tk()
+    app = StockMonitorApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    run_app()

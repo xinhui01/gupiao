@@ -1,41 +1,60 @@
+from __future__ import annotations
+
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import pandas as pd
 from typing import List, Dict, Any, Optional, Callable
+import threading
+import weakref
+
+import pandas as pd
+
 from stock_data import StockDataFetcher
+from concurrent.futures.thread import _worker, _threads_queues
+
+
+class DaemonThreadPoolExecutor(ThreadPoolExecutor):
+    def _adjust_thread_count(self):
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_, q=self._work_queue):
+            q.put(None)
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
+            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
+            t = threading.Thread(
+                name=thread_name,
+                target=_worker,
+                args=(
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    self._initializer,
+                    self._initargs,
+                ),
+                daemon=True,
+            )
+            t.start()
+            self._threads.add(t)
+            _threads_queues[t] = self._work_queue
 
 
 class StockFilter:
     def __init__(self):
         self.fetcher = StockDataFetcher()
         self._log: Optional[Callable[[str], None]] = None
-        self.min_volume_ratio = 3.0
-        self.min_inner_outer_ratio = 1.0
-        self.min_main_net_inflow = 0
         self.trend_days = 5
         self.ma_period = 5
-        self.min_price = 2.0
-        self.max_price = 100.0
+        self.limit_up_lookback_days = 5
+        self.volume_lookback_days = 5
+        self.volume_expand_enabled = True
+        self.volume_expand_factor = 2.0
+        self.require_limit_up_within_days = False
 
     def set_log_callback(self, cb: Optional[Callable[[str], None]]) -> None:
         self._log = cb
         self.fetcher.set_log_callback(cb)
-
-    def check_volume_ratio(self, stock_data: Dict[str, Any]) -> bool:
-        volume_ratio = stock_data.get('volume_ratio', 0)
-        return volume_ratio >= self.min_volume_ratio
-
-    def check_inner_outer_ratio(self, inner_outer_data: Dict[str, Any]) -> bool:
-        if inner_outer_data is None:
-            return False
-        ratio = inner_outer_data.get('inner_outer_ratio', 0)
-        return ratio >= self.min_inner_outer_ratio
-
-    def check_main_net_inflow(self, flow_data: Dict[str, Any]) -> bool:
-        if flow_data is None:
-            return False
-        net_inflow = flow_data.get('main_net_inflow', 0)
-        return net_inflow >= self.min_main_net_inflow
 
     def check_close_above_ma(
         self, history_data: pd.DataFrame, streak_days: int, ma_period: int
@@ -44,218 +63,425 @@ class StockFilter:
             return False
         if "close" not in history_data.columns:
             return False
-        
-        df = history_data.sort_values("date").reset_index(drop=True) if "date" in history_data.columns else history_data.reset_index(drop=True)
+
+        df = (
+            history_data.sort_values("date").reset_index(drop=True)
+            if "date" in history_data.columns
+            else history_data.reset_index(drop=True)
+        )
         need = streak_days + ma_period - 1
         if len(df) < need:
             return False
-        
-        ma = df["close"].rolling(window=ma_period, min_periods=ma_period).mean()
-        recent_close = df["close"].tail(streak_days)
+
+        close = pd.to_numeric(df["close"], errors="coerce")
+        ma = close.rolling(window=ma_period, min_periods=ma_period).mean()
+        recent_close = close.tail(streak_days)
         recent_ma = ma.tail(streak_days)
-        if recent_ma.isna().any():
+        if recent_close.isna().any() or recent_ma.isna().any():
             return False
         return bool((recent_close.values > recent_ma.values).all())
 
-    def calculate_trend_strength(self, history_data: pd.DataFrame, days: int = 3) -> float:
-        if history_data is None or len(history_data) < days:
-            return 0.0
-        
-        recent_data = history_data.tail(days)
-        
-        if 'change_pct' not in recent_data.columns:
-            return 0.0
-        
-        return recent_data['change_pct'].sum()
+    def _limit_up_threshold(self, board: str = "", stock_name: str = "") -> float:
+        name = str(stock_name or "").upper().strip()
+        if name.startswith("ST") or name.startswith("*ST"):
+            return 5.0
+        b = str(board or "").strip()
+        if b in ("创业板", "科创板"):
+            return 20.0
+        return 10.0
 
-    def filter_stock(self, stock_code: str) -> Dict[str, Any]:
+    def _format_limit_up_reason(
+        self,
+        hit_dates: List[str],
+        official_reason: str = "",
+    ) -> str:
+        reason = str(official_reason or "").strip()
+        return reason
+
+    def analyze_history(
+        self,
+        history_data: pd.DataFrame,
+        streak_days: Optional[int] = None,
+        ma_period: Optional[int] = None,
+        limit_up_lookback_days: Optional[int] = None,
+        volume_lookback_days: Optional[int] = None,
+        volume_expand_enabled: Optional[bool] = None,
+        volume_expand_factor: Optional[float] = None,
+        board: str = "",
+        stock_name: str = "",
+        stock_code: str = "",
+    ) -> Dict[str, Any]:
+        streak_days = int(streak_days or self.trend_days)
+        ma_period = int(ma_period or self.ma_period)
+        lookback_days = int(limit_up_lookback_days or self.limit_up_lookback_days)
+        volume_days = int(volume_lookback_days or self.volume_lookback_days)
+        volume_enabled = self.volume_expand_enabled if volume_expand_enabled is None else bool(volume_expand_enabled)
+        volume_factor = float(volume_expand_factor or self.volume_expand_factor)
         result = {
-            'code': stock_code,
-            'passed': False,
-            'reasons': [],
-            'data': {}
+            "passed": False,
+            "latest_date": None,
+            "latest_close": None,
+            "latest_ma": None,
+            "latest_change_pct": None,
+            "five_day_return": None,
+            "recent_closes": [],
+            "recent_ma": [],
+            "volume_lookback_days": volume_days,
+            "volume_expand_enabled": volume_enabled,
+            "volume_expand_factor": volume_factor,
+            "volume_min": None,
+            "volume_max": None,
+            "volume_expand_ratio": None,
+            "volume_expand": False,
+            "limit_up_threshold": None,
+            "limit_up": False,
+            "limit_up_within_days": False,
+            "limit_up_hit_dates": [],
+            "limit_up_reason": "",
+            "summary": "",
         }
-        
-        realtime_data = self.fetcher.get_realtime_data(stock_code)
-        if realtime_data is None:
-            result['reasons'].append('无法获取实时数据')
+        if history_data is None or history_data.empty:
+            result["summary"] = "无历史数据"
             return result
-        
-        result['data']['realtime'] = realtime_data
-        
-        if realtime_data['price'] < self.min_price or realtime_data['price'] > self.max_price:
-            result['reasons'].append(f"价格不在范围 [{self.min_price}, {self.max_price}] 内")
+        if "date" not in history_data.columns or "close" not in history_data.columns:
+            result["summary"] = "历史数据缺少 date/close"
             return result
-        
-        if not self.check_volume_ratio(realtime_data):
-            result['reasons'].append(f"量比 {realtime_data['volume_ratio']:.2f} < {self.min_volume_ratio}")
-            return result
-        result['reasons'].append(f"✓ 量比: {realtime_data['volume_ratio']:.2f}")
-        
-        inner_outer_data = self.fetcher.get_inner_outer_disk(stock_code)
-        result['data']['inner_outer'] = inner_outer_data
-        if not self.check_inner_outer_ratio(inner_outer_data):
-            r = (
-                inner_outer_data.get("inner_outer_ratio", 0)
-                if inner_outer_data
-                else 0.0
+
+        df = history_data.sort_values("date").reset_index(drop=True)
+        close = pd.to_numeric(df["close"], errors="coerce")
+        ma = close.rolling(window=ma_period, min_periods=ma_period).mean()
+        recent = df.tail(streak_days).copy()
+        recent_close = pd.to_numeric(recent["close"], errors="coerce")
+        recent_ma = ma.tail(streak_days)
+
+        result["latest_date"] = str(df["date"].iloc[-1])
+        result["latest_close"] = float(close.iloc[-1]) if not pd.isna(close.iloc[-1]) else None
+        result["latest_ma"] = float(ma.iloc[-1]) if not pd.isna(ma.iloc[-1]) else None
+        result["recent_closes"] = [float(v) if not pd.isna(v) else None for v in recent_close.tolist()]
+        result["recent_ma"] = [float(v) if not pd.isna(v) else None for v in recent_ma.tolist()]
+
+        if "change_pct" in df.columns:
+            change_pct = pd.to_numeric(df["change_pct"], errors="coerce")
+            if not change_pct.empty and not pd.isna(change_pct.iloc[-1]):
+                result["latest_change_pct"] = float(change_pct.iloc[-1])
+
+        if len(df) >= streak_days and not pd.isna(close.iloc[-1]) and not pd.isna(close.iloc[-streak_days]):
+            prev_close = close.iloc[-streak_days]
+            if not pd.isna(prev_close) and prev_close != 0:
+                result["five_day_return"] = (float(close.iloc[-1]) / float(prev_close) - 1.0) * 100.0
+
+        if len(df) >= streak_days + ma_period - 1 and not recent_close.isna().any() and not recent_ma.isna().any():
+            result["passed"] = bool((recent_close.values > recent_ma.values).all())
+
+        if "volume" in df.columns and len(df) >= volume_days:
+            volume = pd.to_numeric(df["volume"], errors="coerce")
+            recent_volume = volume.tail(volume_days).dropna()
+            if not recent_volume.empty:
+                vmin = float(recent_volume.min())
+                vmax = float(recent_volume.max())
+                ratio = None
+                if vmin > 0:
+                    ratio = float(vmax / vmin)
+                result["volume_min"] = vmin
+                result["volume_max"] = vmax
+                result["volume_expand_ratio"] = ratio
+                result["volume_expand"] = bool(volume_enabled and ratio is not None and ratio >= volume_factor)
+
+        threshold = self._limit_up_threshold(board=board, stock_name=stock_name)
+        result["limit_up_threshold"] = threshold
+        if "change_pct" in df.columns:
+            change_pct = pd.to_numeric(df["change_pct"], errors="coerce")
+            limit_up_mask = change_pct.tail(max(lookback_days, 1)) >= (threshold - 0.2)
+            recent_dates = df.tail(max(lookback_days, 1))["date"].astype(str).tolist()
+            hit_dates = [d for d, hit in zip(recent_dates, limit_up_mask.tolist()) if bool(hit)]
+            result["limit_up_hit_dates"] = hit_dates
+            result["limit_up_within_days"] = bool(hit_dates)
+            result["limit_up"] = bool(
+                not pd.isna(result["latest_change_pct"])
+                and result["latest_change_pct"] >= (threshold - 0.2)
             )
-            result["reasons"].append(
-                f"内外盘比 {r:.2f} < {self.min_inner_outer_ratio}"
-            )
-            return result
-        result['reasons'].append(f"✓ 内外盘比: {inner_outer_data['inner_outer_ratio']:.2f}")
-        
-        flow_data = self.fetcher.get_individual_flow(stock_code)
-        result['data']['flow'] = flow_data
-        if flow_data:
-            if self.check_main_net_inflow(flow_data):
-                result['reasons'].append(f"✓ 主力净流入: {flow_data['main_net_inflow']:.2f}万元")
-            else:
-                result['reasons'].append(f"主力净流入: {flow_data['main_net_inflow']:.2f}万元 (未达标)")
-        
-        hist_days = max(30, self.trend_days + self.ma_period + 5)
-        history_data = self.fetcher.get_history_data(stock_code, days=hist_days)
-        result['data']['history'] = history_data
-        
-        if self.check_close_above_ma(history_data, self.trend_days, self.ma_period):
-            trend_strength = self.calculate_trend_strength(history_data, self.trend_days)
-            result['reasons'].append(
-                f"✓ 连续{self.trend_days}日收盘均在MA{self.ma_period}之上，累计涨跌 {trend_strength:.2f}%"
+            official_reason = ""
+            if stock_code and hit_dates:
+                for hit_date in reversed(hit_dates):
+                    official_reason = self.fetcher.get_limit_up_reason(stock_code, hit_date)
+                    if official_reason:
+                        break
+            result["limit_up_reason"] = self._format_limit_up_reason(hit_dates, official_reason)
+
+        if result["passed"]:
+            result["summary"] = (
+                f"最近{streak_days}日收盘全部高于MA{ma_period}，"
+                f"最新收盘 {result['latest_close']:.2f} / MA{ma_period} {result['latest_ma']:.2f}"
             )
         else:
-            result['reasons'].append(
-                f"不满足连续{self.trend_days}日收盘>MA{self.ma_period}"
-            )
-            return result
-        
-        result['passed'] = True
+            result["summary"] = f"未满足最近{streak_days}日收盘全部高于MA{ma_period}"
+
+        if volume_enabled and result["volume_expand"]:
+            ratio_text = "-" if result["volume_expand_ratio"] is None else f"{result['volume_expand_ratio']:.2f}倍"
+            result["summary"] = f"{result['summary']}；近{volume_days}日放量 {ratio_text}"
+        elif not volume_enabled:
+            result["summary"] = f"{result['summary']}；放量倍数检测已关闭"
+
+        if result["limit_up_reason"]:
+            result["summary"] = f"{result['summary']}；{result['limit_up_reason']}"
         return result
+
+    def filter_stock(
+        self,
+        stock_code: str,
+        stock_name: str = "",
+        board: str = "",
+        exchange: str = "",
+    ) -> Dict[str, Any]:
+        result = {
+            "code": str(stock_code).strip().zfill(6),
+            "name": stock_name or "",
+            "passed": False,
+            "reasons": [],
+            "data": {},
+        }
+        if board:
+            result["data"]["board"] = board
+        if exchange:
+            result["data"]["exchange"] = exchange
+
+        hist_days = max(
+            14,
+            self.trend_days + self.ma_period + 4,
+            self.limit_up_lookback_days + self.ma_period + 4,
+            self.volume_lookback_days + 4,
+        )
+        history_data = self.fetcher.get_history_data(stock_code, days=hist_days)
+        result["data"]["history"] = history_data
+        if history_data is None or history_data.empty:
+            result["reasons"].append("无法获取历史数据")
+            return result
+
+        analysis = self.analyze_history(
+            history_data,
+            self.trend_days,
+            self.ma_period,
+            self.limit_up_lookback_days,
+            self.volume_lookback_days,
+            self.volume_expand_enabled,
+            self.volume_expand_factor,
+            board=board,
+            stock_name=stock_name,
+            stock_code=stock_code,
+        )
+        result["data"]["analysis"] = analysis
+        result["data"]["history_tail"] = history_data.tail(max(self.trend_days, self.limit_up_lookback_days)).copy()
+
+        if self.require_limit_up_within_days and not analysis.get("limit_up_within_days"):
+            analysis["summary"] = (
+                f"{analysis['summary']}；未命中过去{self.limit_up_lookback_days}个交易日涨停条件"
+                if analysis.get("summary")
+                else f"未命中过去{self.limit_up_lookback_days}个交易日涨停条件"
+            )
+            result["reasons"].append(analysis["summary"])
+            return result
+
+        if analysis.get("passed"):
+            result["passed"] = True
+            result["reasons"].append(analysis["summary"])
+        else:
+            result["reasons"].append(analysis["summary"])
+            return result
+
+        return result
+
+    def _result_sort_key(self, item: Dict[str, Any]):
+        analysis = (item.get("data", {}) or {}).get("analysis") or {}
+        five_day_return = analysis.get("five_day_return")
+        volume_expand_ratio = analysis.get("volume_expand_ratio")
+        latest_change_pct = analysis.get("latest_change_pct")
+        return (
+            five_day_return if five_day_return is not None else float("-inf"),
+            volume_expand_ratio if volume_expand_ratio is not None else float("-inf"),
+            1 if analysis.get("limit_up_within_days") else 0,
+            latest_change_pct if latest_change_pct is not None else float("-inf"),
+            str(item.get("code", "")),
+        )
 
     def scan_all_stocks(
         self,
-        max_stocks: int = 100,
+        max_stocks: int = 0,
         progress_callback=None,
         max_workers: Optional[int] = None,
         should_stop: Optional[Callable[[], bool]] = None,
         refresh_universe: bool = False,
+        allowed_boards: Optional[List[str]] = None,
+        allowed_exchanges: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         log = self._log
+        t0 = time.time()
         if log:
-            log("【阶段 1/3】构建股票池…")
+            log("【阶段 1/3】加载股票池...")
 
-        all_stocks = self.fetcher.get_all_stocks(skip_cache=refresh_universe)
-
+        all_stocks = self.fetcher.get_all_stocks(force_refresh=refresh_universe)
         if all_stocks.empty:
             if log:
-                log("列表为空，扫描终止。")
+                log("股票池为空，扫描终止。")
             return []
 
-        has_spot_columns = (
-            "price" in all_stocks.columns and "volume_ratio" in all_stocks.columns
-        )
+        total_universe = len(all_stocks)
+        if allowed_boards and "board" in all_stocks.columns:
+            allowed_board_set = {str(x).strip() for x in allowed_boards if str(x).strip()}
+            if allowed_board_set:
+                before = len(all_stocks)
+                all_stocks = all_stocks[all_stocks["board"].astype(str).isin(allowed_board_set)]
+                if log:
+                    log(
+                        f"板块过滤：保留 {len(all_stocks)}/{before} 只，目标板块 {', '.join(sorted(allowed_board_set))}"
+                    )
+        if allowed_exchanges and "exchange" in all_stocks.columns:
+            allowed_exchange_set = {str(x).strip() for x in allowed_exchanges if str(x).strip()}
+            if allowed_exchange_set:
+                before = len(all_stocks)
+                all_stocks = all_stocks[all_stocks["exchange"].astype(str).isin(allowed_exchange_set)]
+                if log:
+                    log(
+                        f"交易所过滤：保留 {len(all_stocks)}/{before} 只，目标交易所 {', '.join(sorted(allowed_exchange_set))}"
+                    )
 
-        if has_spot_columns:
-            if log:
-                log(
-                    f"【阶段 2/3】东方财富全表模式：原始 {len(all_stocks)} 只，按现价、量比预筛…"
-                )
-            all_stocks = all_stocks[all_stocks["price"] > 0]
-            all_stocks = all_stocks[
-                all_stocks["volume_ratio"] >= self.min_volume_ratio
-            ]
+        if max_stocks and max_stocks > 0:
+            subset = all_stocks.head(max_stocks).reset_index(drop=True)
         else:
-            if log:
-                log(
-                    f"【阶段 2/3】交易所列表模式：共 {len(all_stocks)} 只，"
-                    f"无量比预筛；已随机打乱后依次检测（每只单独请求行情）…"
-                )
-            all_stocks = all_stocks.sample(frac=1, random_state=None).reset_index(
-                drop=True
-            )
-
-        results: List[Dict[str, Any]] = []
-        total = min(len(all_stocks), max_stocks)
-        subset = all_stocks.head(max_stocks)
-        tasks: List[tuple[str, str]] = []
-        for _, row in subset.iterrows():
-            code = str(row["code"]).strip().zfill(6)
-            name = str(row.get("name", "") or "")
-            tasks.append((code, name))
+            subset = all_stocks.reset_index(drop=True)
+        total = len(subset)
 
         if max_workers is None:
             try:
-                max_workers = int(
-                    os.environ.get("GUPPIAO_SCAN_WORKERS", "12").strip() or "12"
-                )
+                max_workers = int(os.environ.get("GUPPIAO_SCAN_WORKERS", "12").strip() or "12")
             except ValueError:
                 max_workers = 12
-        workers = max(1, min(int(max_workers), 64))
+        workers = max(1, min(int(max_workers), 16))
 
         if log:
             log(
-                f"将检测 {total} 只：【阶段 3/3】并发 {workers} 线程拉取行情/资金/K线（过大易限流）…"
+                f"【阶段 2/3】股票池 {total_universe} 只，本次扫描 {total} 只，最近{self.trend_days}日收盘 > MA{self.ma_period}，并发 {workers} 线程。"
             )
+            log("说明：扫描阶段只拉历史日线，不拉实时、资金流或内外盘。")
 
-        executor = ThreadPoolExecutor(max_workers=workers)
+        results: List[Dict[str, Any]] = []
+        completed = 0
+        last_report = time.time()
+        report_every = 25
+
+        def _submit_tasks(executor: ThreadPoolExecutor):
+            future_to_meta = {}
+            for _, row in subset.iterrows():
+                code = str(row["code"]).strip().zfill(6)
+                name = str(row.get("name", "") or "")
+                board = str(row.get("board", "") or "")
+                exchange = str(row.get("exchange", "") or "")
+                future = executor.submit(self.filter_stock, code, name, board, exchange)
+                future_to_meta[future] = (code, name, board, exchange)
+            return future_to_meta
+
+        executor = DaemonThreadPoolExecutor(max_workers=workers)
         try:
-            future_to_meta = {
-                executor.submit(self.filter_stock, code): (code, name)
-                for code, name in tasks
-            }
-            done_count = 0
+            future_to_meta = _submit_tasks(executor)
+            if log:
+                log("【阶段 3/3】开始逐只拉取历史日线并计算结果...")
+
             for fut in as_completed(future_to_meta):
-                code, name = future_to_meta[fut]
+                code, name, board, exchange = future_to_meta[fut]
                 if should_stop and should_stop():
                     if log:
-                        log("收到停止信号，正在取消未完成任务…")
+                        log("收到停止信号，正在取消未完成任务...")
                     break
+
                 try:
                     filter_result = fut.result()
                 except Exception as e:
                     if log:
-                        log(f"  {code} 检测异常: {e}")
+                        log(f"  {code} {name} 检测异常: {e}")
                     filter_result = {
                         "code": code,
+                        "name": name,
                         "passed": False,
                         "reasons": [str(e)],
-                        "data": {},
+                        "data": {"board": board, "exchange": exchange},
                     }
-                done_count += 1
-                if log:
-                    log(f"  → {done_count}/{total} {code} {name}")
+
+                completed += 1
+                analysis = filter_result.get("data", {}).get("analysis") or {}
+
+                if filter_result.get("passed") and log:
+                    log(
+                        f"  通过 {completed}/{total} {code} {name} "
+                        f"最新收盘 {analysis.get('latest_close', 0):.2f} / MA{self.ma_period} {analysis.get('latest_ma', 0):.2f}"
+                    )
+
+                if filter_result.get("passed"):
+                    filter_result["name"] = name
+                    filter_result.setdefault("data", {})
+                    filter_result["data"].setdefault("board", board)
+                    filter_result["data"].setdefault("exchange", exchange)
+                    results.append(filter_result)
+
                 if progress_callback:
                     try:
-                        progress_callback(done_count, total, code, name)
+                        progress_callback(completed, total, code, name)
                     except StopIteration:
                         raise
-                if filter_result.get("passed") and filter_result.get("data", {}).get(
-                    "realtime"
-                ):
-                    filter_result["data"]["realtime"]["name"] = name
-                    results.append(filter_result)
+
+                now = time.time()
+                if log and (completed % report_every == 0 or now - last_report >= 10):
+                    elapsed = now - t0
+                    log(
+                        f"进度 {completed}/{total}，命中 {len(results)} 只，已用时 {elapsed:.1f}s，当前 {code} {name}"
+                    )
+                    last_report = now
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
-        results.sort(key=lambda x: str(x.get("code", "")))
+        results.sort(key=self._result_sort_key, reverse=True)
 
         if log:
-            log(f"阶段 3/3 结束，符合条件共 {len(results)} 只。")
+            elapsed = time.time() - t0
+            log(f"【完成】扫描结束，命中 {len(results)} 只，用时 {elapsed:.1f}s。")
 
         return results
 
     def get_stock_detail(self, stock_code: str) -> Dict[str, Any]:
-        detail = {
-            'code': stock_code,
-            'realtime': None,
-            'flow': None,
-            'inner_outer': None,
-            'history': None
+        history = self.fetcher.get_history_data(
+            stock_code,
+            days=max(30, self.trend_days + self.limit_up_lookback_days + self.ma_period + 4),
+        )
+        name = ""
+        board = ""
+        exchange = ""
+        try:
+            universe = self.fetcher.get_all_stocks()
+            match = universe[universe["code"].astype(str).str.zfill(6) == str(stock_code).strip().zfill(6)]
+            if not match.empty:
+                row = match.iloc[0]
+                name = str(row.get("name", "") or "")
+                board = str(row.get("board", "") or "")
+                exchange = str(row.get("exchange", "") or "")
+        except Exception:
+            pass
+        analysis = self.analyze_history(
+            history,
+            self.trend_days,
+            self.ma_period,
+            self.limit_up_lookback_days,
+            self.volume_lookback_days,
+            self.volume_expand_enabled,
+            self.volume_expand_factor,
+            board=board,
+            stock_name=name,
+            stock_code=stock_code,
+        )
+        if analysis.get("limit_up_reason") and not analysis.get("summary"):
+            analysis["summary"] = analysis["limit_up_reason"]
+        return {
+            "code": str(stock_code).strip().zfill(6),
+            "name": name,
+            "board": board,
+            "exchange": exchange,
+            "history": history,
+            "analysis": analysis,
         }
-        
-        detail['realtime'] = self.fetcher.get_realtime_data(stock_code)
-        detail['flow'] = self.fetcher.get_individual_flow(stock_code)
-        detail['inner_outer'] = self.fetcher.get_inner_outer_disk(stock_code)
-        detail['history'] = self.fetcher.get_history_data(stock_code, days=10)
-        
-        return detail
