@@ -1,6 +1,7 @@
 import os
 import time
 import re
+import warnings
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, TypeVar, Tuple
 from datetime import datetime, timedelta
@@ -12,8 +13,10 @@ from stock_store import (
     clear_history as clear_history_store,
     clear_scan_snapshots,
     clear_universe as clear_universe_store,
+    load_fund_flow as load_fund_flow_store,
     load_history as load_history_store,
     load_universe as load_universe_store,
+    save_fund_flow as save_fund_flow_store,
     save_history as save_history_store,
     save_universe as save_universe_store,
 )
@@ -134,6 +137,21 @@ _apply_network_patches()
 
 import akshare as ak
 import pandas as pd
+from pandas.errors import SettingWithCopyWarning
+
+warnings.filterwarnings(
+    "ignore",
+    category=SettingWithCopyWarning,
+    module=r"akshare\.stock\.stock_board_concept_em",
+)
+
+
+def _call_akshare_quietly(fn: Callable[..., T], *args, **kwargs) -> T:
+    # AkShare's concept-board helpers emit noisy SettingWithCopyWarning logs
+    # even when the returned data is usable. Silence only that warning locally.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SettingWithCopyWarning)
+        return _retry_ak_call(fn, *args, **kwargs)
 
 def clear_universe_data() -> None:
     """清空已保存的股票池和扫描快照。"""
@@ -172,6 +190,8 @@ def _load_universe_store(
             if str(x).strip().zfill(6).startswith("688")
             else _infer_sz_board(x)
         )
+    if "concepts" not in df.columns:
+        df["concepts"] = ""
     df["code"] = (
         df["code"]
         .astype(str)
@@ -179,9 +199,10 @@ def _load_universe_store(
         .str.strip()
         .str.zfill(6)
     )
+    df["concepts"] = df["concepts"].astype(str).map(_normalize_concepts_text)
     if log:
         log(f"已从 data/stock_store.sqlite3 读取股票池 {len(df)} 只")
-    return df[["code", "name", "exchange", "board"]]
+    return df[["code", "name", "exchange", "board", "concepts"]]
 
 
 def _load_history_store(
@@ -211,6 +232,32 @@ def _save_history_store(stock_code: str, df: pd.DataFrame, keep_rows: int = 40) 
     out["date"] = out["date"].astype(str).str.strip()
     out = out.sort_values("date").tail(max(keep_rows, 10)).reset_index(drop=True)
     save_history_store(stock_code, out)
+
+
+def _load_fund_flow_store(
+    stock_code: str,
+    min_rows: int,
+    log: Optional[Callable[[str], None]] = None,
+) -> Optional[pd.DataFrame]:
+    df = load_fund_flow_store(stock_code)
+    if df is None or df.empty or "date" not in df.columns:
+        return None
+    df["date"] = df["date"].astype(str).str.strip()
+    df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    if len(df) < min_rows:
+        return None
+    if log:
+        log(f"已从 data/stock_store.sqlite3 读取资金流 {stock_code} {len(df)} 行")
+    return df
+
+
+def _save_fund_flow_store(stock_code: str, df: pd.DataFrame, keep_rows: int = 40) -> None:
+    if df is None or df.empty or "date" not in df.columns:
+        return
+    out = df.copy()
+    out["date"] = out["date"].astype(str).str.strip()
+    out = out.sort_values("date").tail(max(keep_rows, 10)).reset_index(drop=True)
+    save_fund_flow_store(stock_code, out)
 
 
 def _eastmoney_request_mirror_urls(url: str) -> List[str]:
@@ -376,6 +423,17 @@ def _norm_code_series(s: pd.Series) -> pd.Series:
     )
 
 
+def _norm_code(code: Any) -> str:
+    return (
+        str(code)
+        .replace(".0", "")
+        .strip()
+        .zfill(6)
+        if str(code).strip() and str(code).strip().lower() != "nan"
+        else ""
+    )
+
+
 def _infer_sz_board(code: str) -> str:
     c = str(code).strip().zfill(6)
     if c.startswith(("300", "301")):
@@ -388,6 +446,53 @@ def _infer_sz_board(code: str) -> str:
 def _infer_exchange(code: str) -> str:
     c = str(code).strip().zfill(6)
     return "上交所" if c.startswith(("5", "6", "9")) else "深交所"
+
+
+def _infer_market(code: str) -> str:
+    c = str(code).strip().zfill(6)
+    if c.startswith(("4", "8")):
+        return "bj"
+    return "sh" if c.startswith(("5", "6", "9")) else "sz"
+
+
+def _normalize_concepts_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or text.lower() == "nan":
+        return ""
+    parts: List[str] = []
+    for raw in re.split(r"[、,，;；|/]+", text):
+        item = raw.strip()
+        if not item or item.lower() == "nan":
+            continue
+        if item not in parts:
+            parts.append(item)
+    return "、".join(parts)
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip() == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _today_ymd() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _should_refresh_today_row(df: Optional[pd.DataFrame], date_col: str = "date") -> bool:
+    if df is None or df.empty or date_col not in df.columns:
+        return False
+    latest_date = str(df[date_col].iloc[-1]).strip()
+    if latest_date != _today_ymd():
+        return False
+    now = datetime.now()
+    # 15:30 之后默认认为日线与日资金流已基本稳定，可直接复用缓存。
+    return now.hour < 15 or (now.hour == 15 and now.minute < 30)
 
 
 def _build_a_share_universe(log: Optional[Callable[[str], None]] = None) -> pd.DataFrame:
@@ -449,6 +554,9 @@ class StockDataFetcher:
     def __init__(self):
         self._log: Optional[Callable[[str], None]] = None
         self._strong_pool_cache: Dict[str, pd.DataFrame] = {}
+        self._concepts_cache: Optional[Dict[str, str]] = None
+        self._universe_concepts_cache: Optional[Dict[str, str]] = None
+        self.concept_board_limit: int = 35
 
     def set_log_callback(self, cb: Optional[Callable[[str], None]]) -> None:
         self._log = cb
@@ -456,9 +564,101 @@ class StockDataFetcher:
 
     def clear_saved_universe_data(self) -> None:
         clear_universe_data()
+        self._concepts_cache = None
+        self._universe_concepts_cache = None
 
     def clear_history_data(self) -> None:
         clear_history_data()
+
+    def _load_concepts_map(
+        self,
+        target_codes: Optional[List[str]] = None,
+        max_boards: Optional[int] = None,
+    ) -> Dict[str, str]:
+        target_set = {
+            _norm_code(code) for code in (target_codes or []) if _norm_code(code)
+        }
+        if not target_set:
+            return {}
+        if self._concepts_cache is None:
+            self._concepts_cache = {}
+        cache = self._concepts_cache
+        pending = {code for code in target_set if not cache.get(code)}
+        if not pending:
+            return {code: cache.get(code, "") for code in target_set}
+
+        board_cap = max(1, int(max_boards or self.concept_board_limit))
+        concept_map: Dict[str, List[str]] = {}
+        if self._log:
+            self._log(
+                f"开始补全股票概念：目标 {len(pending)} 只，最多扫描 {board_cap} 个概念板块。"
+            )
+
+        try:
+            boards = _call_akshare_quietly(ak.stock_board_concept_name_em)
+        except Exception as e:
+            if self._log:
+                self._log(f"概念板块名称获取失败: {e}")
+            return {code: cache.get(code, "") for code in target_set}
+
+        if boards is None or boards.empty or "板块名称" not in boards.columns:
+            return {code: cache.get(code, "") for code in target_set}
+
+        board_names = [
+            str(name).strip()
+            for name in boards["板块名称"].tolist()
+            if str(name).strip()
+        ]
+        if not board_names:
+            return {code: cache.get(code, "") for code in target_set}
+
+        board_names = board_names[:board_cap]
+        total = len(board_names)
+        found_codes: set[str] = set()
+
+        for idx, board_name in enumerate(board_names, start=1):
+            if pending and pending.issubset(found_codes):
+                break
+            try:
+                cons = _call_akshare_quietly(ak.stock_board_concept_cons_em, symbol=board_name)
+            except Exception as e:
+                if self._log and (idx % 10 == 0 or idx == total):
+                    self._log(f"概念板块 {idx}/{total} {board_name} 获取失败: {e}")
+                continue
+
+            if cons is None or cons.empty:
+                continue
+
+            code_col = "代码" if "代码" in cons.columns else "code" if "code" in cons.columns else None
+            if code_col is None:
+                continue
+
+            codes = cons[code_col].astype(str).map(_norm_code).tolist()
+            for code in codes:
+                if not code or code not in pending:
+                    continue
+                bucket = concept_map.setdefault(code, [])
+                if board_name not in bucket:
+                    bucket.append(board_name)
+                found_codes.add(code)
+
+            if self._log and (idx % 10 == 0 or idx == total):
+                self._log(
+                    f"概念板块进度 {idx}/{total}: {board_name}，已命中 {len(concept_map)} / {len(pending)} 只"
+                )
+
+        for code, names in concept_map.items():
+            cache[code] = _normalize_concepts_text("、".join(names))
+        return {code: cache.get(code, "") for code in target_set}
+
+    def _set_universe_concepts_cache(self, df: pd.DataFrame) -> None:
+        cache: Dict[str, str] = {}
+        if df is not None and not df.empty and "code" in df.columns and "concepts" in df.columns:
+            for code, concepts in zip(df["code"].astype(str), df["concepts"].astype(str)):
+                norm_code = _norm_code(code)
+                if norm_code:
+                    cache[norm_code] = _normalize_concepts_text(concepts)
+        self._universe_concepts_cache = cache
 
     def _normalize_trade_date(self, trade_date: str) -> str:
         return re.sub(r"\D", "", str(trade_date or ""))[:8]
@@ -496,6 +696,80 @@ class StockDataFetcher:
             return ""
         return reason
 
+    def get_stock_concepts(self, stock_code: str) -> str:
+        code = str(stock_code or "").strip().zfill(6)
+        if not code:
+            return ""
+        if self._universe_concepts_cache is None:
+            universe_df = _load_universe_store(None)
+            if universe_df is not None and not universe_df.empty and "concepts" in universe_df.columns:
+                self._set_universe_concepts_cache(universe_df)
+            else:
+                self._set_universe_concepts_cache(pd.DataFrame())
+        cached = self._universe_concepts_cache.get(code, "") if self._universe_concepts_cache else ""
+        if cached:
+            return _normalize_concepts_text(cached)
+        mapped = self._load_concepts_map([code], max_boards=self.concept_board_limit)
+        return _normalize_concepts_text(mapped.get(code, ""))
+
+    def get_fund_flow_data(
+        self,
+        stock_code: str,
+        days: int = 30,
+        force_refresh: bool = False,
+    ) -> Optional[pd.DataFrame]:
+        code = str(stock_code or "").strip().zfill(6)
+        if not code:
+            return None
+        min_rows = max(1, int(days))
+        if not force_refresh:
+            cached = _load_fund_flow_store(code, min_rows=min_rows, log=self._log)
+            if cached is not None and not cached.empty:
+                if not _should_refresh_today_row(cached):
+                    return cached.tail(days).reset_index(drop=True)
+                if self._log:
+                    self._log(f"资金流 {code} 命中当天缓存，但尚未收盘，改为刷新最新数据。")
+        market = _infer_market(code)
+        try:
+            flow_df = _retry_ak_call(ak.stock_individual_fund_flow, stock=code, market=market)
+        except Exception as e:
+            if self._log:
+                self._log(f"个股资金流 {code} 获取失败: {e}")
+            return None
+        if flow_df is None or flow_df.empty:
+            return None
+        df = flow_df.rename(
+            columns={
+                "日期": "date",
+                "收盘价": "close",
+                "涨跌幅": "change_pct",
+                "主力净流入-净额": "main_force_amount",
+                "主力净流入-净占比": "main_force_ratio",
+                "大单净流入-净额": "big_order_amount",
+                "大单净流入-净占比": "big_order_ratio",
+                "超大单净流入-净额": "super_big_order_amount",
+                "超大单净流入-净占比": "super_big_order_ratio",
+            }
+        ).copy()
+        if "date" not in df.columns:
+            return None
+        df["date"] = df["date"].astype(str).str.strip()
+        for col in [
+            "close",
+            "change_pct",
+            "main_force_amount",
+            "main_force_ratio",
+            "big_order_amount",
+            "big_order_ratio",
+            "super_big_order_amount",
+            "super_big_order_ratio",
+        ]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+        _save_fund_flow_store(code, df, keep_rows=max(60, days + 10))
+        return df.tail(days).reset_index(drop=True)
+
     def get_all_stocks(self, force_refresh: bool = False) -> pd.DataFrame:
         if _use_em_full_spot_for_list():
             return self._get_all_stocks_em_spot()
@@ -508,6 +782,7 @@ class StockDataFetcher:
         if not force_refresh:
             universe_df = _load_universe_store(self._log)
             if universe_df is not None and not universe_df.empty:
+                self._set_universe_concepts_cache(universe_df)
                 return universe_df
         if self._log:
             self._log(
@@ -516,6 +791,7 @@ class StockDataFetcher:
         df = _build_a_share_universe(self._log)
         if not df.empty:
             _save_universe_store(df, self._log)
+            self._set_universe_concepts_cache(df)
         return df
 
     def _get_all_stocks_em_spot(self) -> pd.DataFrame:
@@ -560,6 +836,7 @@ class StockDataFetcher:
                     else _infer_sz_board(x)
                 )
             save_universe_store(stock_list)
+            self._set_universe_concepts_cache(stock_list)
             if self._log:
                 self._log(f"东方财富全表下载完成，共 {len(stock_list)} 条。")
             return stock_list
@@ -585,7 +862,10 @@ class StockDataFetcher:
             if not force_refresh:
                 history_df = _load_history_store(stock_code, min_rows, end_date, self._log)
                 if history_df is not None and not history_df.empty:
-                    return history_df.tail(days).reset_index(drop=True)
+                    if not _should_refresh_today_row(history_df):
+                        return history_df.tail(days).reset_index(drop=True)
+                    if self._log:
+                        self._log(f"历史 {stock_code} 命中当天缓存，但尚未收盘，改为刷新最新日线。")
 
             start_date = (datetime.now() - timedelta(days=days + 15)).strftime('%Y%m%d')
             

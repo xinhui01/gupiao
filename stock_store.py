@@ -39,6 +39,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             name TEXT NOT NULL DEFAULT '',
             exchange TEXT NOT NULL DEFAULT '',
             board TEXT NOT NULL DEFAULT '',
+            concepts TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL DEFAULT ''
         );
 
@@ -59,6 +60,21 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (code, trade_date)
         );
 
+        CREATE TABLE IF NOT EXISTS fund_flow (
+            code TEXT NOT NULL,
+            trade_date TEXT NOT NULL,
+            close REAL,
+            change_pct REAL,
+            main_force_amount REAL,
+            main_force_ratio REAL,
+            big_order_amount REAL,
+            big_order_ratio REAL,
+            super_big_order_amount REAL,
+            super_big_order_ratio REAL,
+            updated_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (code, trade_date)
+        );
+
         CREATE TABLE IF NOT EXISTS scan_snapshots (
             signature TEXT PRIMARY KEY,
             scan_date TEXT NOT NULL,
@@ -69,6 +85,11 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(universe)").fetchall()
+    }
+    if "concepts" not in existing_columns:
+        conn.execute("ALTER TABLE universe ADD COLUMN concepts TEXT NOT NULL DEFAULT ''")
 
 
 def db_path() -> Path:
@@ -104,7 +125,7 @@ def clear_universe() -> None:
 
 def clear_history() -> None:
     with _DB_WRITE_LOCK:
-        _retry_locked(lambda: _clear_table("history"))
+        _retry_locked(lambda: (_clear_table("history"), _clear_table("fund_flow")))
 
 
 def clear_scan_snapshots() -> None:
@@ -116,19 +137,21 @@ def save_universe(df: pd.DataFrame) -> None:
     if df is None or df.empty or "code" not in df.columns:
         return
     out = df.copy()
-    for col in ["name", "exchange", "board"]:
+    for col in ["name", "exchange", "board", "concepts"]:
         if col not in out.columns:
             out[col] = ""
     out["code"] = out["code"].astype(str).str.strip().str.zfill(6)
     out["name"] = out["name"].astype(str).fillna("")
     out["exchange"] = out["exchange"].astype(str).fillna("")
     out["board"] = out["board"].astype(str).fillna("")
+    out["concepts"] = out["concepts"].astype(str).fillna("")
     rows = [
         (
             str(row["code"]),
             str(row.get("name", "") or ""),
             str(row.get("exchange", "") or ""),
             str(row.get("board", "") or ""),
+            str(row.get("concepts", "") or ""),
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
         for _, row in out.iterrows()
@@ -137,12 +160,13 @@ def save_universe(df: pd.DataFrame) -> None:
         with _connect() as conn:
             conn.executemany(
                 """
-                INSERT INTO universe(code, name, exchange, board, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO universe(code, name, exchange, board, concepts, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(code) DO UPDATE SET
                     name=excluded.name,
                     exchange=excluded.exchange,
                     board=excluded.board,
+                    concepts=excluded.concepts,
                     updated_at=excluded.updated_at
                 """,
                 rows,
@@ -158,7 +182,7 @@ def load_universe() -> Optional[pd.DataFrame]:
     def _read():
         with _connect() as conn:
             return pd.read_sql_query(
-                "SELECT code, name, exchange, board FROM universe ORDER BY code",
+                "SELECT code, name, exchange, board, concepts FROM universe ORDER BY code",
                 conn,
                 dtype={"code": str},
             )
@@ -267,6 +291,99 @@ def load_history(stock_code: str, limit: Optional[int] = None) -> Optional[pd.Da
     return df.reset_index(drop=True)
 
 
+def save_fund_flow(stock_code: str, df: pd.DataFrame) -> None:
+    if df is None or df.empty or "date" not in df.columns:
+        return
+    code = str(stock_code).strip().zfill(6)
+    out = df.copy()
+    out["date"] = out["date"].astype(str).str.strip()
+    for col in [
+        "close",
+        "change_pct",
+        "main_force_amount",
+        "main_force_ratio",
+        "big_order_amount",
+        "big_order_ratio",
+        "super_big_order_amount",
+        "super_big_order_ratio",
+    ]:
+        if col not in out.columns:
+            out[col] = None
+    out = out.sort_values("date").reset_index(drop=True)
+    rows = [
+        (
+            code,
+            str(row["date"]),
+            _to_float(row.get("close")),
+            _to_float(row.get("change_pct")),
+            _to_float(row.get("main_force_amount")),
+            _to_float(row.get("main_force_ratio")),
+            _to_float(row.get("big_order_amount")),
+            _to_float(row.get("big_order_ratio")),
+            _to_float(row.get("super_big_order_amount")),
+            _to_float(row.get("super_big_order_ratio")),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        for _, row in out.iterrows()
+    ]
+
+    def _write():
+        with _connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO fund_flow(
+                    code, trade_date, close, change_pct, main_force_amount, main_force_ratio,
+                    big_order_amount, big_order_ratio, super_big_order_amount, super_big_order_ratio, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(code, trade_date) DO UPDATE SET
+                    close=excluded.close,
+                    change_pct=excluded.change_pct,
+                    main_force_amount=excluded.main_force_amount,
+                    main_force_ratio=excluded.main_force_ratio,
+                    big_order_amount=excluded.big_order_amount,
+                    big_order_ratio=excluded.big_order_ratio,
+                    super_big_order_amount=excluded.super_big_order_amount,
+                    super_big_order_ratio=excluded.super_big_order_ratio,
+                    updated_at=excluded.updated_at
+                """,
+                rows,
+            )
+
+    with _DB_WRITE_LOCK:
+        _retry_locked(_write)
+
+
+def load_fund_flow(stock_code: str, limit: Optional[int] = None) -> Optional[pd.DataFrame]:
+    if not _DB_PATH.is_file():
+        return None
+    code = str(stock_code).strip().zfill(6)
+    sql = """
+        SELECT trade_date AS date, close, change_pct, main_force_amount, main_force_ratio,
+               big_order_amount, big_order_ratio, super_big_order_amount, super_big_order_ratio
+        FROM fund_flow
+        WHERE code = ?
+    """
+    params: List[Any] = [code]
+    if limit is not None and limit > 0:
+        sql += " ORDER BY trade_date DESC LIMIT ?"
+        params.append(int(limit))
+    else:
+        sql += " ORDER BY trade_date"
+
+    def _read():
+        with _connect() as conn:
+            return pd.read_sql_query(sql, conn, params=params)
+
+    df = _retry_locked(_read)
+    if df.empty:
+        return None
+    df["date"] = df["date"].astype(str).str.strip()
+    if limit is not None and limit > 0:
+        df = df.sort_values("date").reset_index(drop=True)
+    return df.reset_index(drop=True)
+
+
 def save_scan_snapshot(signature: str, payload: Dict[str, Any]) -> None:
     def _write():
         with _connect() as conn:
@@ -310,6 +427,30 @@ def load_scan_snapshot(signature: str, scan_date: Optional[str] = None) -> Optio
     if scan_date is not None and str(row["scan_date"]) != str(scan_date):
         return None
     if int(row["complete"]) != 1:
+        return None
+    try:
+        return json.loads(row["payload_json"])
+    except Exception:
+        return None
+
+
+def load_latest_scan_snapshot() -> Optional[Dict[str, Any]]:
+    if not _DB_PATH.is_file():
+        return None
+    sql = """
+        SELECT payload_json, scan_date, complete
+        FROM scan_snapshots
+        WHERE complete = 1
+        ORDER BY saved_at DESC
+        LIMIT 1
+    """
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(sql).fetchone()
+
+    row = _retry_locked(_read)
+    if row is None:
         return None
     try:
         return json.loads(row["payload_json"])
