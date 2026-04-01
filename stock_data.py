@@ -82,6 +82,120 @@ def _retry_ak_call(fn: Callable[..., T], *args, retries: int = 5, base_delay: fl
             raise
 
 
+def _fetch_eastmoney_hist_frame(
+    stock_code: str,
+    days: int,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """直接抓东方财富历史日线，并在多个镜像间轮换。"""
+    import random
+
+    import requests
+
+    market_code = 1 if str(stock_code).startswith("6") else 0
+    params = {
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
+        "ut": "7eea3edcaed734bea9cbfc24409ed989",
+        "klt": "101",
+        "fqt": "0",
+        "secid": f"{market_code}.{stock_code}",
+        "beg": start_date,
+        "end": end_date,
+    }
+    mirrors = [
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+        "https://push2.eastmoney.com/api/qt/stock/kline/get",
+        "https://82.push2.eastmoney.com/api/qt/stock/kline/get",
+        "https://33.push2.eastmoney.com/api/qt/stock/kline/get",
+        "https://7.push2.eastmoney.com/api/qt/stock/kline/get",
+        "https://81.push2.eastmoney.com/api/qt/stock/kline/get",
+        "https://72.push2.eastmoney.com/api/qt/stock/kline/get",
+        "https://28.push2.eastmoney.com/api/qt/stock/kline/get",
+    ]
+    timeout = 30
+    last_exception: Optional[BaseException] = None
+
+    for base_url in mirrors:
+        for attempt in range(4):
+            try:
+                with requests.Session() as session:
+                    if _use_bypass_proxy():
+                        session.trust_env = False
+                        session.proxies = {"http": None, "https": None}
+                    req_kw: Dict[str, Any] = {
+                        "url": base_url,
+                        "params": params,
+                        "timeout": timeout,
+                        "headers": dict(_EASTMONEY_HEADERS),
+                    }
+                    if _use_insecure_ssl():
+                        req_kw["verify"] = False
+                    response = session.get(**req_kw)
+                    response.raise_for_status()
+                    data_json = response.json()
+                    klines = (data_json.get("data") or {}).get("klines") or []
+                    if not klines:
+                        return pd.DataFrame()
+                    temp_df = pd.DataFrame([item.split(",") for item in klines])
+                    temp_df["股票代码"] = str(stock_code).strip().zfill(6)
+                    temp_df.columns = [
+                        "日期",
+                        "开盘",
+                        "收盘",
+                        "最高",
+                        "最低",
+                        "成交量",
+                        "成交额",
+                        "振幅",
+                        "涨跌幅",
+                        "涨跌额",
+                        "换手率",
+                        "股票代码",
+                    ]
+                    temp_df["日期"] = pd.to_datetime(temp_df["日期"], errors="coerce").dt.date
+                    for col in [
+                        "开盘",
+                        "收盘",
+                        "最高",
+                        "最低",
+                        "成交量",
+                        "成交额",
+                        "振幅",
+                        "涨跌幅",
+                        "涨跌额",
+                        "换手率",
+                    ]:
+                        temp_df[col] = pd.to_numeric(temp_df[col], errors="coerce")
+                    temp_df = temp_df[
+                        [
+                            "日期",
+                            "股票代码",
+                            "开盘",
+                            "收盘",
+                            "最高",
+                            "最低",
+                            "成交量",
+                            "成交额",
+                            "振幅",
+                            "涨跌幅",
+                            "涨跌额",
+                            "换手率",
+                        ]
+                    ]
+                    return temp_df
+            except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+                last_exception = e
+                if attempt < 3:
+                    time.sleep(1.2 * (attempt + 1) + random.uniform(0.3, 0.9))
+                else:
+                    time.sleep(random.uniform(0.2, 0.6))
+    if last_exception is not None:
+        raise last_exception
+    return pd.DataFrame()
+
+
 # 须在 import akshare 之前执行：统一为 requests 补头；可选 SSL / 忽略环境代理
 def _apply_network_patches() -> None:
     need_ssl = _use_insecure_ssl()
@@ -966,13 +1080,12 @@ class StockDataFetcher:
 
             start_date = (datetime.now() - timedelta(days=days + 15)).strftime('%Y%m%d')
             
-            df = _retry_ak_call(
-                ak.stock_zh_a_hist,
-                symbol=stock_code,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust="",
+            df = _history_retry_ak_call(
+                _fetch_eastmoney_hist_frame,
+                stock_code,
+                days,
+                start_date,
+                end_date,
             )
             
             if df.empty:
