@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import json
@@ -15,6 +15,7 @@ import pandas as pd
 import tkinter as tk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from matplotlib.ticker import FuncFormatter
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 
 from stock_filter import StockFilter
@@ -41,6 +42,9 @@ class StockMonitorApp:
         self._detail_request_code = ""
         self._detail_loading_code = ""
         self._detail_after_id = None
+        self._current_detail_code = ""
+        self._intraday_request_code = ""
+        self._intraday_loading_code = ""
         self.sort_column = "five_day_return"
         self.sort_reverse = True
         self.is_scanning = False
@@ -219,6 +223,7 @@ class StockMonitorApp:
 
         self.setup_result_tab()
         self.setup_detail_tab()
+        self.setup_intraday_tab()
         self.setup_log_tab()
 
     def setup_result_tab(self):
@@ -238,7 +243,6 @@ class StockMonitorApp:
             "code",
             "name",
             "board",
-            "concepts",
             "latest_close",
             "latest_ma",
             "five_day_return",
@@ -249,7 +253,6 @@ class StockMonitorApp:
             "volume_break_limit_up",
             "after_two_limit_up",
             "limit_up",
-            "limit_up_reason",
             "recent_closes",
         )
         tree_container = ttk.Frame(result_frame)
@@ -263,7 +266,6 @@ class StockMonitorApp:
             "code": ("代码", 90),
             "name": ("名称", 140),
             "board": ("板块", 120),
-            "concepts": ("概念", 220),
             "latest_close": ("最新收盘", 100),
             "latest_ma": ("MA", 100),
             "five_day_return": ("5日涨幅", 90),
@@ -274,7 +276,6 @@ class StockMonitorApp:
             "volume_break_limit_up": ("放量断板", 90),
             "after_two_limit_up": ("二连板后", 90),
             "limit_up": ("涨停", 70),
-            "limit_up_reason": ("涨停原因", 200),
             "recent_closes": ("最近收盘", 220),
         }
         default_visible_columns = (
@@ -392,7 +393,6 @@ class StockMonitorApp:
             "code": str(result.get("code", "-") or "-"),
             "name": str(result.get("name", "-") or "-"),
             "board": str(data.get("board") or data.get("exchange") or "-"),
-            "concepts": self._short_text(data.get("concepts", "-"), 30),
             "latest_close": "-" if analysis.get("latest_close") is None else f"{analysis['latest_close']:.2f}",
             "latest_ma": "-" if analysis.get("latest_ma") is None else f"{analysis['latest_ma']:.2f}",
             "five_day_return": "-" if five_day_return is None else f"{five_day_return:.2f}%",
@@ -403,7 +403,6 @@ class StockMonitorApp:
             "volume_break_limit_up": "是" if analysis.get("volume_break_limit_up") else "否",
             "after_two_limit_up": "是" if analysis.get("after_two_limit_up") else "否",
             "limit_up": "是" if analysis.get("limit_up") else "否",
-            "limit_up_reason": str(analysis.get("limit_up_reason") or "-"),
             "recent_closes": ", ".join("-" if v is None else f"{v:.2f}" for v in recent),
         }
 
@@ -551,7 +550,6 @@ class StockMonitorApp:
         items = [
             ("code", "股票代码"),
             ("name", "股票名称"),
-            ("concepts", "概念"),
             ("latest_date", "最新日期"),
             ("quote_time", "刷新时间"),
             ("latest_close", "最新收盘"),
@@ -561,7 +559,6 @@ class StockMonitorApp:
             ("latest_amount", "成交额"),
             ("five_day_return", "5日涨幅"),
             ("limit_up", "涨停"),
-            ("limit_up_reason", "涨停原因"),
             ("volume_expand", "放量"),
             ("volume_expand_ratio", "放量倍数"),
             ("big_order_amount", "大单净额"),
@@ -588,6 +585,36 @@ class StockMonitorApp:
         )
         self.canvas = FigureCanvasTkAgg(self.fig, master=chart_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas.mpl_connect("button_press_event", self.on_detail_chart_click)
+
+    def setup_intraday_tab(self):
+        intraday_frame = ttk.Frame(self.notebook, padding="5")
+        self.notebook.add(intraday_frame, text="分时")
+        self.intraday_tab = intraday_frame
+
+        info = ttk.Frame(intraday_frame)
+        info.pack(fill=tk.X, pady=(0, 6))
+        self.intraday_title_var = tk.StringVar(value="分时图（点击 K 线打开）")
+        ttk.Label(info, textvariable=self.intraday_title_var).pack(side=tk.LEFT)
+
+        chart_frame = ttk.LabelFrame(intraday_frame, text="分时走势", padding="5")
+        chart_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        self.intraday_fig = Figure(figsize=(11, 6.8), dpi=100)
+        gs = self.intraday_fig.add_gridspec(
+            2,
+            2,
+            width_ratios=[4.0, 1.4],
+            height_ratios=[3.0, 1.2],
+            wspace=0.32,
+            hspace=0.14,
+        )
+        self.intraday_price_ax = self.intraday_fig.add_subplot(gs[0, 0])
+        self.intraday_volume_ax = self.intraday_fig.add_subplot(gs[1, 0], sharex=self.intraday_price_ax)
+        self.intraday_dist_ax = self.intraday_fig.add_subplot(gs[:, 1])
+        self.intraday_canvas = FigureCanvasTkAgg(self.intraday_fig, master=chart_frame)
+        self.intraday_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._draw_intraday_loading("点击详情页 K 线打开分时")
 
     def setup_log_tab(self):
         log_frame = ttk.Frame(self.notebook, padding="5")
@@ -666,22 +693,6 @@ class StockMonitorApp:
             return f"{volume / 1e4:.2f}万"
         return f"{volume:.0f}"
 
-    def _ensure_result_concepts(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not results:
-            return results
-        for result in results:
-            data = result.setdefault("data", {}) or {}
-            concepts = str(data.get("concepts", "") or "").strip()
-            if concepts:
-                continue
-            code = str(result.get("code", "") or "").strip().zfill(6)
-            if not code:
-                continue
-            concepts = self.stock_filter.fetcher.get_stock_concepts(code)
-            if concepts:
-                data["concepts"] = concepts
-        return results
-
     def _filter_results_by_selected_boards(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         allowed = {str(board).strip() for board in self._selected_boards() if str(board).strip()}
         if not allowed:
@@ -743,7 +754,6 @@ class StockMonitorApp:
                     "data": {
                         "board": data.get("board", ""),
                         "exchange": data.get("exchange", ""),
-                        "concepts": data.get("concepts", ""),
                         "analysis": analysis,
                     },
                 }
@@ -893,8 +903,6 @@ class StockMonitorApp:
             return str(item.get("name", ""))
         if column == "board":
             return str(data.get("board") or data.get("exchange") or "")
-        if column == "concepts":
-            return str(data.get("concepts") or "")
         if column == "latest_close":
             value = analysis.get("latest_close")
             return float(value) if value is not None else float("-inf")
@@ -919,8 +927,6 @@ class StockMonitorApp:
             return 1 if analysis.get("after_two_limit_up") else 0
         if column == "limit_up":
             return 1 if analysis.get("limit_up") else 0
-        if column == "limit_up_reason":
-            return str(analysis.get("limit_up_reason", ""))
         if column == "recent_closes":
             recent = analysis.get("recent_closes") or []
             return tuple("" if v is None else f"{float(v):010.4f}" for v in recent)
@@ -1007,11 +1013,17 @@ class StockMonitorApp:
         self._close_run_log()
 
     def on_stock_select(self, event):
-        selection = self.result_tree.selection()
-        if selection:
+        try:
+            selection = self.result_tree.selection()
+            if not selection:
+                return
             item = self.result_tree.item(selection[0])
-            stock_code = item["values"][0]
-            self._schedule_show_stock_detail(stock_code)
+            values = item.get("values") or []
+            if not values:
+                return
+            self._schedule_show_stock_detail(values[0])
+        except Exception as e:
+            self._log(f"选择股票详情失败: {e}")
 
     def on_stock_double_click(self, event):
         selection = self.result_tree.selection()
@@ -1049,6 +1061,8 @@ class StockMonitorApp:
         code = str(stock_code).strip().zfill(6)
         self._cancel_scheduled_detail()
         self._detail_request_code = code
+        self._show_detail_loading(code)
+
         detail_payload = None
         for result in self.filtered_stocks:
             if str(result.get("code", "")).strip().zfill(6) == code:
@@ -1058,15 +1072,18 @@ class StockMonitorApp:
                     "name": result.get("name", ""),
                     "board": data.get("board", ""),
                     "exchange": data.get("exchange", ""),
-                    "concepts": data.get("concepts", ""),
                     "history": data.get("history"),
                     "analysis": data.get("analysis") or {},
                 }
                 break
 
         if detail_payload is not None:
-            self._log(f"展示扫描结果中的股票 {code} 详情。")
-            self._update_detail_ui(detail_payload)
+            self._log(f"显示扫描结果中的股票 {code} 详情。")
+            try:
+                self._update_detail_ui(detail_payload)
+            except Exception as e:
+                self._log(f"渲染缓存详情失败: {e}")
+                self._show_detail_error(code, f"渲染详情失败: {e}")
             if not force_refresh and self._detail_loading_code == code:
                 self.status_var.set(f"{code} 详情正在加载...")
                 return
@@ -1079,13 +1096,12 @@ class StockMonitorApp:
         if not force_refresh and self._detail_loading_code == code:
             self.status_var.set(f"{code} 详情正在加载...")
             return
+
         self._log(f"查询股票 {code} 的历史详情...")
         self.status_var.set(f"正在查询 {code}...")
-        self._show_detail_loading(code)
         self._detail_loading_code = code
         detail_thread = threading.Thread(target=self._load_detail, args=(code,), daemon=True)
         detail_thread.start()
-
     def _load_detail(self, stock_code: str):
         try:
             detail = self.stock_filter.get_stock_detail(stock_code)
@@ -1093,14 +1109,18 @@ class StockMonitorApp:
         except Exception as e:
             error_text = str(e)
             self.root.after(0, lambda: self._log(f"查询详情出错: {error_text}"))
+            self.root.after(0, lambda: self._show_detail_error(stock_code, f"详情加载失败: {error_text}"))
         finally:
             self.root.after(0, lambda: self._finish_detail_status(stock_code))
 
     def _apply_detail_if_current(self, stock_code: str, detail: Dict[str, Any]) -> None:
         if str(stock_code).strip().zfill(6) != self._detail_request_code:
             return
-        self._update_detail_ui(detail)
-
+        try:
+            self._update_detail_ui(detail)
+        except Exception as e:
+            self._log(f"更新详情面板失败: {e}")
+            self._show_detail_error(stock_code, f"详情渲染失败: {e}")
     def _finish_detail_status(self, stock_code: str) -> None:
         code = str(stock_code).strip().zfill(6)
         if code == self._detail_loading_code:
@@ -1113,7 +1133,6 @@ class StockMonitorApp:
         placeholders = {
             "code": str(stock_code).strip().zfill(6),
             "name": "加载中...",
-            "concepts": "加载中...",
             "latest_date": "加载中...",
             "quote_time": "加载中...",
             "latest_close": "加载中...",
@@ -1123,7 +1142,6 @@ class StockMonitorApp:
             "latest_amount": "加载中...",
             "five_day_return": "加载中...",
             "limit_up": "加载中...",
-            "limit_up_reason": "加载中...",
             "big_order_amount": "加载中...",
             "main_force_amount": "加载中...",
             "summary": "正在加载详情数据...",
@@ -1142,13 +1160,31 @@ class StockMonitorApp:
         self.flow_ax.set_axis_off()
         self.canvas.draw()
 
+    def _show_detail_error(self, stock_code: str, message: str) -> None:
+        code_text = str(stock_code).strip().zfill(6)
+        if "code" in self.detail_labels:
+            self.detail_labels["code"].config(text=code_text)
+        if "name" in self.detail_labels:
+            self.detail_labels["name"].config(text="加载失败")
+        if "summary" in self.detail_labels:
+            self.detail_labels["summary"].config(text=message or "详情加载失败")
+        self.price_ax.clear()
+        self.volume_ax.clear()
+        self.flow_ax.clear()
+        self.price_ax.text(0.5, 0.5, "详情加载失败", ha="center", va="center", fontsize=14, color="#b22222")
+        self.volume_ax.text(0.5, 0.5, "请查看运行日志", ha="center", va="center", fontsize=11)
+        self.flow_ax.text(0.5, 0.5, "请稍后重试", ha="center", va="center", fontsize=11)
+        self.price_ax.set_axis_off()
+        self.volume_ax.set_axis_off()
+        self.flow_ax.set_axis_off()
+        self.canvas.draw()
     def _update_detail_ui(self, detail: Dict[str, Any]):
         analysis = detail.get("analysis") or {}
         history = detail.get("history")
+        self._current_detail_code = str(detail.get("code", "") or "").strip().zfill(6)
 
         self.detail_labels["code"].config(text=detail.get("code", "-"))
         self.detail_labels["name"].config(text=detail.get("name", "-"))
-        self.detail_labels["concepts"].config(text=self._short_text(detail.get("concepts", "-"), 60))
         self.detail_labels["latest_date"].config(text=analysis.get("latest_date", "-"))
         self.detail_labels["quote_time"].config(text=analysis.get("quote_time", "-") or "-")
         self.detail_labels["latest_close"].config(
@@ -1166,7 +1202,6 @@ class StockMonitorApp:
             text="-" if analysis.get("five_day_return") is None else f"{analysis['five_day_return']:.2f}%"
         )
         self.detail_labels["limit_up"].config(text="是" if analysis.get("limit_up") else "否")
-        self.detail_labels["limit_up_reason"].config(text=analysis.get("limit_up_reason", "-"))
         self.detail_labels["big_order_amount"].config(text=self._format_amount(analysis.get("big_order_amount")))
         self.detail_labels["main_force_amount"].config(text=self._format_amount(analysis.get("main_force_amount")))
         self.detail_labels["summary"].config(text=analysis.get("summary", "-"))
@@ -1250,7 +1285,7 @@ class StockMonitorApp:
         self.volume_ax.set_xlim(-0.5, len(x) - 0.5)
         self.flow_ax.set_xlim(-0.5, len(x) - 0.5)
         self.price_ax.set_ylabel("价格")
-        self.price_ax.set_title("近一个月K线")
+        self.price_ax.set_title("近一个月K线（点击图表进入分时）")
         self.price_ax.legend(loc="upper left")
         self.price_ax.grid(True, alpha=0.25)
         self.volume_ax.set_ylabel("成交量")
@@ -1269,6 +1304,307 @@ class StockMonitorApp:
         self.fig.tight_layout()
         self.canvas.draw()
 
+    def on_detail_chart_click(self, event):
+        if event is None:
+            return
+        if event.inaxes not in (self.price_ax, self.volume_ax, self.flow_ax):
+            return
+        code = str(self._current_detail_code or self._detail_request_code or "").strip().zfill(6)
+        if not code:
+            return
+        self.open_intraday_view(code)
+
+    def open_intraday_view(self, stock_code: str):
+        code = str(stock_code or "").strip().zfill(6)
+        if not code:
+            return
+        self._intraday_request_code = code
+        self.intraday_title_var.set(f"分时图 - {code}")
+        self._draw_intraday_loading(f"正在加载 {code} 分时...")
+        self.notebook.select(self.intraday_tab)
+
+        if self._intraday_loading_code == code:
+            return
+        self._intraday_loading_code = code
+        threading.Thread(target=self._load_intraday, args=(code,), daemon=True).start()
+
+    def _load_intraday(self, stock_code: str):
+        try:
+            payload = self.stock_filter.get_stock_intraday(stock_code)
+            self.root.after(0, lambda: self._apply_intraday_if_current(stock_code, payload))
+        except Exception as e:
+            self.root.after(0, lambda: self._draw_intraday_error(stock_code, f"分时加载失败: {e}"))
+            self.root.after(0, lambda: self._log(f"分时加载失败 {stock_code}: {e}"))
+        finally:
+            self.root.after(0, lambda: self._finish_intraday_status(stock_code))
+
+    def _apply_intraday_if_current(self, stock_code: str, payload: Dict[str, Any]) -> None:
+        code = str(stock_code).strip().zfill(6)
+        if code != self._intraday_request_code:
+            return
+        intraday_df = payload.get("intraday")
+        prev_close = payload.get("prev_close")
+        self._draw_intraday_chart(code, intraday_df, prev_close=prev_close)
+
+    def _finish_intraday_status(self, stock_code: str) -> None:
+        code = str(stock_code).strip().zfill(6)
+        if code == self._intraday_loading_code:
+            self._intraday_loading_code = ""
+
+    def _draw_intraday_loading(self, message: str):
+        self.intraday_price_ax.clear()
+        self.intraday_volume_ax.clear()
+        self.intraday_dist_ax.clear()
+        self.intraday_price_ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=13)
+        self.intraday_volume_ax.text(0.5, 0.5, "请稍候", ha="center", va="center", fontsize=11)
+        self.intraday_dist_ax.text(0.5, 0.5, "等待分时数据", ha="center", va="center", fontsize=11)
+        self.intraday_price_ax.set_axis_off()
+        self.intraday_volume_ax.set_axis_off()
+        self.intraday_dist_ax.set_axis_off()
+        self.intraday_canvas.draw()
+    def _draw_intraday_error(self, stock_code: str, message: str):
+        self.intraday_title_var.set(f"分时图 - {str(stock_code).strip().zfill(6)}")
+        self.intraday_price_ax.clear()
+        self.intraday_volume_ax.clear()
+        self.intraday_dist_ax.clear()
+        self.intraday_price_ax.text(0.5, 0.5, "分时数据加载失败", ha="center", va="center", fontsize=13, color="#b22222")
+        self.intraday_volume_ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=10)
+        self.intraday_dist_ax.text(0.5, 0.5, "无分布数据", ha="center", va="center", fontsize=10)
+        self.intraday_price_ax.set_axis_off()
+        self.intraday_volume_ax.set_axis_off()
+        self.intraday_dist_ax.set_axis_off()
+        self.intraday_canvas.draw()
+    def _draw_intraday_chart(self, stock_code: str, intraday_df, prev_close: Optional[float] = None):
+        code = str(stock_code).strip().zfill(6)
+        self.intraday_title_var.set(f"分时图 - {code}")
+        self.intraday_price_ax.clear()
+        self.intraday_volume_ax.clear()
+        self.intraday_dist_ax.clear()
+        self.intraday_price_ax.set_axis_on()
+        self.intraday_volume_ax.set_axis_on()
+        self.intraday_dist_ax.set_axis_on()
+
+        if intraday_df is None or getattr(intraday_df, "empty", True):
+            self._draw_intraday_error(code, "暂无分时数据")
+            return
+
+        df = intraday_df.copy().reset_index(drop=True)
+        close_series = pd.to_numeric(df.get("close"), errors="coerce")
+        open_series = pd.to_numeric(df.get("open"), errors="coerce")
+        high_series = pd.to_numeric(df.get("high"), errors="coerce")
+        low_series = pd.to_numeric(df.get("low"), errors="coerce")
+        volume_series = pd.to_numeric(df.get("volume"), errors="coerce").fillna(0)
+        times = pd.to_datetime(df.get("time"), errors="coerce")
+
+        if close_series.isna().all() or times.isna().all():
+            self._draw_intraday_error(code, "分时数据无有效价格")
+            return
+
+        first_close = close_series.dropna()
+        if prev_close is not None and pd.notna(prev_close) and float(prev_close) > 0:
+            base_price = float(prev_close)
+        elif not first_close.empty:
+            base_price = float(first_close.iloc[0])
+        else:
+            base_price = 1.0
+
+        # 自动纠正价格单位（如分/厘与元混用），避免价格轴出现几百上千的异常。
+        if not first_close.empty and base_price > 0:
+            median_price = float(first_close.median())
+            scale_candidates = [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
+            best_scale = 1.0
+            best_diff = abs((median_price / base_price) - 1.0)
+            for scale in scale_candidates:
+                diff = abs((median_price * scale / base_price) - 1.0)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_scale = scale
+            if best_scale != 1.0 and best_diff < 0.65:
+                close_series = close_series * best_scale
+                open_series = open_series * best_scale
+                high_series = high_series * best_scale
+                low_series = low_series * best_scale
+
+        x = list(range(len(df)))
+
+        cum_volume = volume_series.cumsum()
+        if (cum_volume > 0).any():
+            avg_price = (close_series.ffill().fillna(0) * volume_series).cumsum() / cum_volume.replace(0, pd.NA)
+            avg_price = pd.to_numeric(avg_price, errors="coerce")
+        else:
+            avg_price = close_series.expanding(min_periods=1).mean()
+        ma5 = close_series.rolling(window=5, min_periods=1).mean()
+
+        pct_close = (close_series / base_price - 1.0) * 100.0
+        pct_avg = (avg_price / base_price - 1.0) * 100.0
+        pct_ma5 = (ma5 / base_price - 1.0) * 100.0
+
+        self.intraday_price_ax.plot(x, pct_close, color="#2f6fd6", linewidth=1.4, label="分时")
+        self.intraday_price_ax.plot(x, pct_avg, color="#f08a24", linewidth=1.3, label="均价线")
+        self.intraday_price_ax.plot(x, pct_ma5, color="#7b52ab", linewidth=1.0, linestyle="--", alpha=0.85, label="MA5")
+        self.intraday_price_ax.axhline(0.0, color="#888888", linewidth=0.9, linestyle="--", alpha=0.85, label="昨收")
+        self.intraday_price_ax.grid(True, alpha=0.25)
+        self.intraday_price_ax.set_ylabel("涨\n跌\n幅\n(%)", rotation=0, labelpad=14, va="center")
+        self.intraday_price_ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.1f}%"))
+
+        valid_pct = pd.concat([pct_close, pct_avg, pct_ma5], ignore_index=True)
+        valid_pct = pd.to_numeric(valid_pct, errors="coerce").dropna()
+        if valid_pct.empty:
+            self.intraday_price_ax.set_ylim(-2.0, 2.0)
+        else:
+            low = float(valid_pct.quantile(0.01))
+            high = float(valid_pct.quantile(0.99))
+            if low > high:
+                low, high = high, low
+            span = max(high - low, 0.4)
+            pad = max(span * 0.12, 0.08)
+            low = max(low - pad, -35.0)
+            high = min(high + pad, 35.0)
+            # 没有负值时不强行显示负区间；没有正值时同理。
+            if low >= 0:
+                low = max(0.0, low - max(span * 0.04, 0.03))
+            if high <= 0:
+                high = min(0.0, high + max(span * 0.04, 0.03))
+            if abs(high - low) < 0.2:
+                mid = (high + low) / 2.0
+                low, high = mid - 0.1, mid + 0.1
+            self.intraday_price_ax.set_ylim(low, high)
+
+        secax = self.intraday_price_ax.secondary_yaxis(
+            "right",
+            functions=(
+                lambda y: base_price * (1.0 + y / 100.0),
+                lambda p: (p / base_price - 1.0) * 100.0,
+            ),
+        )
+        secax.set_ylabel("价\n格\n(元)", rotation=0, labelpad=12, va="center")
+        secax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.2f}"))
+
+        time_labels = [t.strftime("%H:%M") if not pd.isna(t) else "" for t in times]
+        auction_indexes = [idx for idx, label in enumerate(time_labels) if label == "09:25"]
+        has_auction = bool(auction_indexes)
+        self.intraday_price_ax.set_title("分时走势（含竞价）" if has_auction else "分时走势（不含竞价）")
+        self.intraday_price_ax.legend(loc="upper left", fontsize=9)
+
+        if has_auction:
+            q_idx = auction_indexes[0]
+            self.intraday_price_ax.axvline(q_idx, color="#888888", linewidth=0.9, alpha=0.7, linestyle=":")
+            self.intraday_price_ax.text(
+                q_idx,
+                self.intraday_price_ax.get_ylim()[1],
+                "竞价",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+                color="#666666",
+            )
+            q_price = pd.to_numeric(close_series.iloc[q_idx], errors="coerce")
+            if pd.notna(q_price):
+                q_pct = (float(q_price) / base_price - 1.0) * 100.0
+                self.intraday_price_ax.scatter([q_idx], [q_pct], s=22, color="#666666", zorder=4)
+
+        self.intraday_price_ax.text(
+            0.995,
+            0.98,
+            "竞价: 有(09:25)" if has_auction else "竞价: 无",
+            transform=self.intraday_price_ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8,
+            color="#555555",
+            bbox=dict(boxstyle="round,pad=0.2", fc="#f2f2f2", ec="#c9c9c9", alpha=0.9),
+        )
+
+        colors = [
+            "#d94b4b" if (not pd.isna(c) and not pd.isna(o) and c >= o) else "#1f8b4c"
+            for o, c in zip(open_series, close_series)
+        ]
+        self.intraday_volume_ax.bar(x, volume_series, width=0.65, color=colors, alpha=0.85)
+        self.intraday_volume_ax.grid(True, alpha=0.2)
+        self.intraday_volume_ax.set_ylabel("成\n交\n量", rotation=0, labelpad=10, va="center")
+        self.intraday_volume_ax.set_xlabel("时间")
+        if has_auction:
+            self.intraday_volume_ax.axvline(q_idx, color="#888888", linewidth=0.9, alpha=0.65, linestyle=":")
+
+        key_times = ["09:25", "09:30", "10:30", "11:30", "13:00", "14:00", "15:00"]
+        tick_map: Dict[int, str] = {}
+        for idx, text in enumerate(time_labels):
+            if text in key_times and idx not in tick_map:
+                tick_map[idx] = text
+
+        if x:
+            tick_map[0] = time_labels[0]
+            tick_map[len(x) - 1] = time_labels[-1]
+
+        tick_positions = sorted(tick_map.keys())
+        tick_labels = [tick_map[pos] for pos in tick_positions]
+        if len(tick_positions) < 5 and x:
+            tick_step = max(1, len(x) // 7)
+            tick_positions = x[::tick_step]
+            if tick_positions[-1] != x[-1]:
+                tick_positions.append(x[-1])
+            tick_labels = [time_labels[pos] for pos in tick_positions]
+
+        self.intraday_price_ax.set_xticks(tick_positions)
+        self.intraday_price_ax.set_xticklabels([])
+        self.intraday_price_ax.tick_params(axis="x", which="both", length=0)
+
+        self.intraday_volume_ax.set_xticks(tick_positions)
+        self.intraday_volume_ax.set_xticklabels(tick_labels, rotation=90, ha="center", fontsize=8)
+
+        dist_df = pd.DataFrame({"price": close_series, "volume": volume_series}).dropna(subset=["price"])
+        dist_df["volume"] = pd.to_numeric(dist_df["volume"], errors="coerce").fillna(0)
+        dist_df = dist_df[dist_df["volume"] > 0]
+
+        if dist_df.empty:
+            self.intraday_dist_ax.text(0.5, 0.5, "暂无成交分布数据", ha="center", va="center", fontsize=11)
+            self.intraday_dist_ax.set_axis_off()
+        else:
+            dist_df["price"] = dist_df["price"].round(2)
+            grouped = dist_df.groupby("price", as_index=False)["volume"].sum()
+            total_volume = float(grouped["volume"].sum())
+
+            if total_volume <= 0:
+                self.intraday_dist_ax.text(0.5, 0.5, "暂无成交分布数据", ha="center", va="center", fontsize=11)
+                self.intraday_dist_ax.set_axis_off()
+            else:
+                grouped["ratio"] = grouped["volume"] / total_volume
+                grouped = grouped.sort_values("ratio", ascending=False).reset_index(drop=True)
+                grouped = grouped.head(min(12, len(grouped)))
+
+                y = list(range(len(grouped)))
+                ratios_pct = (grouped["ratio"] * 100.0).tolist()
+                labels = [f"{p:.2f}" for p in grouped["price"].tolist()]
+                self.intraday_dist_ax.barh(y, ratios_pct, color="#5b7bd5", alpha=0.9)
+                self.intraday_dist_ax.set_yticks(y)
+                self.intraday_dist_ax.set_yticklabels(labels, fontsize=9)
+                self.intraday_dist_ax.invert_yaxis()
+                self.intraday_dist_ax.yaxis.tick_right()
+                self.intraday_dist_ax.tick_params(axis="y", labelright=True, labelleft=False, pad=4)
+                self.intraday_dist_ax.set_xlabel("占比(%)")
+                self.intraday_dist_ax.set_ylabel("价
+位
+(元)", rotation=0, labelpad=14, va="center")
+                self.intraday_dist_ax.yaxis.set_label_position("right")
+                self.intraday_dist_ax.set_title("成交价格分布")
+                self.intraday_dist_ax.grid(True, axis="x", alpha=0.2)
+
+                for yi, v in zip(y, ratios_pct):
+                    # Place ratio labels inside bars to avoid overlapping the right-side price ticks.
+                    text_x = max(v - 0.35, 0.12)
+                    text_color = "white" if v >= 3.0 else "#222222"
+                    self.intraday_dist_ax.text(
+                        text_x,
+                        yi,
+                        f"{v:.2f}%",
+                        va="center",
+                        ha="right",
+                        fontsize=8,
+                        color=text_color,
+                    )
+
+        self.intraday_fig.tight_layout(rect=[0.02, 0.06, 0.98, 0.98], h_pad=1.2, w_pad=0.8)
+        self.intraday_canvas.draw()
     def export_results(self):
         if not self.filtered_stocks:
             messagebox.showwarning("警告", "没有可导出的结果")
@@ -1285,7 +1621,7 @@ class StockMonitorApp:
         try:
             with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
-                writer.writerow(["代码", "名称", "板块", "概念", "最新日期", "最新收盘", "MA", "5日涨幅", "放量倍数", "放量", "涨停", "涨停原因", "最近收盘", "结论"])
+                writer.writerow(["代码", "名称", "板块", "最新日期", "最新收盘", "MA", "5日涨幅", "放量倍数", "放量", "涨停", "最近收盘", "结论"])
                 for result in self.filtered_stocks:
                     data = result.get("data", {}) or {}
                     analysis = data.get("analysis") or {}
@@ -1295,7 +1631,6 @@ class StockMonitorApp:
                             result.get("code", ""),
                             result.get("name", ""),
                             data.get("board", data.get("exchange", "")),
-                            data.get("concepts", ""),
                             analysis.get("latest_date", ""),
                             "" if analysis.get("latest_close") is None else f"{analysis['latest_close']:.2f}",
                             "" if analysis.get("latest_ma") is None else f"{analysis['latest_ma']:.2f}",
@@ -1303,7 +1638,6 @@ class StockMonitorApp:
                             "" if analysis.get("volume_expand_ratio") is None else f"{analysis['volume_expand_ratio']:.2f}x",
                             "是" if analysis.get("volume_expand") else "否",
                             "是" if analysis.get("limit_up") else "否",
-                            analysis.get("limit_up_reason", ""),
                             ", ".join("" if v is None else f"{v:.2f}" for v in recent),
                             analysis.get("summary", ""),
                         ]
@@ -1386,7 +1720,7 @@ class StockMonitorApp:
                 table.auto_set_font_size(False)
                 table.set_fontsize(8.5 if len(display_columns) >= 10 else 9.2)
 
-                left_aligned_columns = {"name", "concepts", "limit_up_reason", "recent_closes"}
+                left_aligned_columns = {"name", "recent_closes"}
                 for (row_index, col_index), cell in table.get_celld().items():
                     cell.set_edgecolor("#d7deea")
                     cell.set_linewidth(0.6)
@@ -1525,3 +1859,18 @@ def run_app():
 
 if __name__ == "__main__":
     run_app()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

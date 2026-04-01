@@ -56,6 +56,36 @@ class StockFilter:
         self._log = cb
         self.fetcher.set_log_callback(cb)
 
+    def _call_with_timeout(
+        self,
+        task: Callable[[], Any],
+        timeout_sec: float,
+        fallback: Any = None,
+        task_name: str = "任务",
+    ) -> Any:
+        result: Dict[str, Any] = {}
+        error: Dict[str, Exception] = {}
+        done = threading.Event()
+
+        def _runner() -> None:
+            try:
+                result["value"] = task()
+            except Exception as exc:
+                error["err"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=_runner, daemon=True).start()
+        if not done.wait(timeout=max(0.5, float(timeout_sec))):
+            if self._log:
+                self._log(f"{task_name} 超时（>{timeout_sec:.0f}s），已跳过。")
+            return fallback
+        if "err" in error:
+            if self._log:
+                self._log(f"{task_name} 失败: {error['err']}")
+            return fallback
+        return result.get("value", fallback)
+
     def check_close_above_ma(
         self, history_data: pd.DataFrame, streak_days: int, ma_period: int
     ) -> bool:
@@ -89,14 +119,6 @@ class StockFilter:
         if b in ("创业板", "科创板"):
             return 20.0
         return 10.0
-
-    def _format_limit_up_reason(
-        self,
-        hit_dates: List[str],
-        official_reason: str = "",
-    ) -> str:
-        reason = str(official_reason or "").strip()
-        return reason
 
     def analyze_history(
         self,
@@ -138,7 +160,6 @@ class StockFilter:
             "limit_up": False,
             "limit_up_within_days": False,
             "limit_up_hit_dates": [],
-            "limit_up_reason": "",
             "limit_up_streak": 0,
             "broken_limit_up": False,
             "broken_streak_count": 0,
@@ -209,14 +230,6 @@ class StockFilter:
                 not pd.isna(result["latest_change_pct"])
                 and result["latest_change_pct"] >= (threshold - 0.2)
             )
-            official_reason = ""
-            if stock_code and hit_dates:
-                for hit_date in reversed(hit_dates):
-                    official_reason = self.fetcher.get_limit_up_reason(stock_code, hit_date)
-                    if official_reason:
-                        break
-            result["limit_up_reason"] = self._format_limit_up_reason(hit_dates, official_reason)
-
             streak = 0
             for flag in reversed(full_limit_up_mask.tolist()):
                 if bool(flag):
@@ -265,8 +278,6 @@ class StockFilter:
         elif not volume_enabled:
             result["summary"] = f"{result['summary']}；放量倍数检测已关闭"
 
-        if result["limit_up_reason"]:
-            result["summary"] = f"{result['summary']}；{result['limit_up_reason']}"
         if result["limit_up_streak"] >= 2:
             result["summary"] = f"{result['summary']}；连板 {result['limit_up_streak']} 板"
         if result["broken_limit_up"]:
@@ -281,7 +292,6 @@ class StockFilter:
         stock_name: str = "",
         board: str = "",
         exchange: str = "",
-        concepts: str = "",
     ) -> Dict[str, Any]:
         result = {
             "code": str(stock_code).strip().zfill(6),
@@ -294,8 +304,6 @@ class StockFilter:
             result["data"]["board"] = board
         if exchange:
             result["data"]["exchange"] = exchange
-        if concepts:
-            result["data"]["concepts"] = concepts
 
         hist_days = max(
             14,
@@ -334,7 +342,6 @@ class StockFilter:
             return result
 
         if analysis.get("passed"):
-            result["data"]["concepts"] = self.fetcher.get_stock_concepts(stock_code)
             result["passed"] = True
             result["reasons"].append(analysis["summary"])
         else:
@@ -402,7 +409,6 @@ class StockFilter:
         else:
             subset = all_stocks.reset_index(drop=True)
         total = len(subset)
-
         if max_workers is None:
             try:
                 max_workers = int(os.environ.get("GUPPIAO_SCAN_WORKERS", "12").strip() or "12")
@@ -428,9 +434,8 @@ class StockFilter:
                 name = str(row.get("name", "") or "")
                 board = str(row.get("board", "") or "")
                 exchange = str(row.get("exchange", "") or "")
-                concepts = str(row.get("concepts", "") or "")
-                future = executor.submit(self.filter_stock, code, name, board, exchange, concepts)
-                future_to_meta[future] = (code, name, board, exchange, concepts)
+                future = executor.submit(self.filter_stock, code, name, board, exchange)
+                future_to_meta[future] = (code, name, board, exchange)
             return future_to_meta
 
         executor = DaemonThreadPoolExecutor(max_workers=workers)
@@ -440,7 +445,7 @@ class StockFilter:
                 log("【阶段 3/3】开始逐只拉取历史日线并计算结果...")
 
             for fut in as_completed(future_to_meta):
-                code, name, board, exchange, concepts = future_to_meta[fut]
+                code, name, board, exchange = future_to_meta[fut]
                 if should_stop and should_stop():
                     if log:
                         log("收到停止信号，正在取消未完成任务...")
@@ -456,7 +461,7 @@ class StockFilter:
                         "name": name,
                         "passed": False,
                         "reasons": [str(e)],
-                        "data": {"board": board, "exchange": exchange, "concepts": concepts},
+                        "data": {"board": board, "exchange": exchange},
                     }
 
                 completed += 1
@@ -473,7 +478,6 @@ class StockFilter:
                     filter_result.setdefault("data", {})
                     filter_result["data"].setdefault("board", board)
                     filter_result["data"].setdefault("exchange", exchange)
-                    filter_result["data"].setdefault("concepts", concepts)
                     results.append(filter_result)
 
                 if progress_callback:
@@ -501,23 +505,33 @@ class StockFilter:
         return results
 
     def get_stock_detail(self, stock_code: str) -> Dict[str, Any]:
-        history = self.fetcher.get_history_data(
-            stock_code,
-            days=max(30, self.trend_days + self.limit_up_lookback_days + self.ma_period + 4),
+        code = str(stock_code).strip().zfill(6)
+        history_days = max(30, self.trend_days + self.limit_up_lookback_days + self.ma_period + 4)
+        history = self._call_with_timeout(
+            lambda: self.fetcher.get_history_data(code, days=history_days),
+            timeout_sec=15.0,
+            fallback=None,
+            task_name=f"详情历史 {code}",
         )
         name = ""
         board = ""
         exchange = ""
-        try:
-            universe = self.fetcher.get_all_stocks()
-            match = universe[universe["code"].astype(str).str.zfill(6) == str(stock_code).strip().zfill(6)]
-            if not match.empty:
-                row = match.iloc[0]
-                name = str(row.get("name", "") or "")
-                board = str(row.get("board", "") or "")
-                exchange = str(row.get("exchange", "") or "")
-        except Exception:
-            pass
+        universe = self._call_with_timeout(
+            lambda: self.fetcher.get_all_stocks(),
+            timeout_sec=8.0,
+            fallback=None,
+            task_name=f"详情股票池 {code}",
+        )
+        if universe is not None:
+            try:
+                match = universe[universe["code"].astype(str).str.zfill(6) == code]
+                if not match.empty:
+                    row = match.iloc[0]
+                    name = str(row.get("name", "") or "")
+                    board = str(row.get("board", "") or "")
+                    exchange = str(row.get("exchange", "") or "")
+            except Exception:
+                pass
         analysis = self.analyze_history(
             history,
             self.trend_days,
@@ -530,8 +544,6 @@ class StockFilter:
             stock_name=name,
             stock_code=stock_code,
         )
-        if analysis.get("limit_up_reason") and not analysis.get("summary"):
-            analysis["summary"] = analysis["limit_up_reason"]
         if history is not None and not history.empty:
             latest_row = history.iloc[-1]
             analysis["latest_volume"] = latest_row.get("volume")
@@ -541,7 +553,12 @@ class StockFilter:
             analysis["latest_volume"] = None
             analysis["latest_amount"] = None
 
-        fund_flow_df = self.fetcher.get_fund_flow_data(stock_code, days=30, force_refresh=False)
+        fund_flow_df = self._call_with_timeout(
+            lambda: self.fetcher.get_fund_flow_data(code, days=30, force_refresh=False),
+            timeout_sec=10.0,
+            fallback=None,
+            task_name=f"详情资金流 {code}",
+        )
         if fund_flow_df is not None and not fund_flow_df.empty:
             latest_flow = fund_flow_df.iloc[-1]
             analysis["flow_date"] = str(latest_flow.get("date", "") or "")
@@ -562,11 +579,35 @@ class StockFilter:
             analysis["super_big_order_ratio"] = None
             analysis["fund_flow_history"] = []
         return {
-            "code": str(stock_code).strip().zfill(6),
+            "code": code,
             "name": name,
             "board": board,
             "exchange": exchange,
-            "concepts": self.fetcher.get_stock_concepts(stock_code),
             "history": history,
             "analysis": analysis,
+        }
+
+    def get_stock_intraday(self, stock_code: str) -> Dict[str, Any]:
+        code = str(stock_code).strip().zfill(6)
+        intraday_df = self._call_with_timeout(
+            lambda: self.fetcher.get_intraday_data(code),
+            timeout_sec=12.0,
+            fallback=None,
+            task_name=f"分时 {code}",
+        )
+        prev_close = None
+        history_df = self._call_with_timeout(
+            lambda: self.fetcher.get_history_data(code, days=2),
+            timeout_sec=6.0,
+            fallback=None,
+            task_name=f"分时昨收 {code}",
+        )
+        if history_df is not None and not history_df.empty and "close" in history_df.columns:
+            close_series = pd.to_numeric(history_df["close"], errors="coerce").dropna()
+            if not close_series.empty:
+                prev_close = float(close_series.iloc[-1])
+        return {
+            "code": code,
+            "intraday": intraday_df,
+            "prev_close": prev_close,
         }

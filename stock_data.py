@@ -2,6 +2,7 @@ import os
 import time
 import re
 import warnings
+import threading
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, TypeVar, Tuple
 from datetime import datetime, timedelta
@@ -152,6 +153,28 @@ def _call_akshare_quietly(fn: Callable[..., T], *args, **kwargs) -> T:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", SettingWithCopyWarning)
         return _retry_ak_call(fn, *args, **kwargs)
+
+
+def _first_existing_column(columns: List[str], candidates: List[str]) -> Optional[str]:
+    normalized = {str(col).strip(): col for col in columns}
+    for name in candidates:
+        key = str(name).strip()
+        if key in normalized:
+            return normalized[key]
+    return None
+
+
+def _find_fund_flow_column(columns: List[str], includes: List[str], excludes: Optional[List[str]] = None) -> Optional[str]:
+    exclude_tokens = [str(x).strip() for x in (excludes or []) if str(x).strip()]
+    for col in columns:
+        text = str(col).strip()
+        if not text:
+            continue
+        if all(token in text for token in includes):
+            if any(token in text for token in exclude_tokens):
+                continue
+            return col
+    return None
 
 def clear_universe_data() -> None:
     """清空已保存的股票池和扫描快照。"""
@@ -556,7 +579,17 @@ class StockDataFetcher:
         self._strong_pool_cache: Dict[str, pd.DataFrame] = {}
         self._concepts_cache: Optional[Dict[str, str]] = None
         self._universe_concepts_cache: Optional[Dict[str, str]] = None
-        self.concept_board_limit: int = 35
+        try:
+            configured_limit = int(os.environ.get("GUPPIAO_CONCEPT_BOARD_LIMIT", "20").strip() or "20")
+        except ValueError:
+            configured_limit = 20
+        self.concept_board_limit: int = max(5, min(configured_limit, 80))
+        try:
+            configured_timeout = float(os.environ.get("GUPPIAO_CONCEPT_FILL_TIMEOUT_SEC", "25").strip() or "25")
+        except ValueError:
+            configured_timeout = 25.0
+        self.concept_fill_timeout_sec: float = max(5.0, configured_timeout)
+        self._concepts_lock = threading.Lock()
 
     def set_log_callback(self, cb: Optional[Callable[[str], None]]) -> None:
         self._log = cb
@@ -580,15 +613,16 @@ class StockDataFetcher:
         }
         if not target_set:
             return {}
-        if self._concepts_cache is None:
-            self._concepts_cache = {}
-        cache = self._concepts_cache
-        pending = {code for code in target_set if not cache.get(code)}
-        if not pending:
-            return {code: cache.get(code, "") for code in target_set}
+        with self._concepts_lock:
+            if self._concepts_cache is None:
+                self._concepts_cache = {}
+            pending = {code for code in target_set if not self._concepts_cache.get(code)}
+            if not pending:
+                return {code: self._concepts_cache.get(code, "") for code in target_set}
 
         board_cap = max(1, int(max_boards or self.concept_board_limit))
         concept_map: Dict[str, List[str]] = {}
+        started_at = time.time()
         if self._log:
             self._log(
                 f"开始补全股票概念：目标 {len(pending)} 只，最多扫描 {board_cap} 个概念板块。"
@@ -599,10 +633,12 @@ class StockDataFetcher:
         except Exception as e:
             if self._log:
                 self._log(f"概念板块名称获取失败: {e}")
-            return {code: cache.get(code, "") for code in target_set}
+            with self._concepts_lock:
+                return {code: self._concepts_cache.get(code, "") for code in target_set}
 
         if boards is None or boards.empty or "板块名称" not in boards.columns:
-            return {code: cache.get(code, "") for code in target_set}
+            with self._concepts_lock:
+                return {code: self._concepts_cache.get(code, "") for code in target_set}
 
         board_names = [
             str(name).strip()
@@ -610,7 +646,8 @@ class StockDataFetcher:
             if str(name).strip()
         ]
         if not board_names:
-            return {code: cache.get(code, "") for code in target_set}
+            with self._concepts_lock:
+                return {code: self._concepts_cache.get(code, "") for code in target_set}
 
         board_names = board_names[:board_cap]
         total = len(board_names)
@@ -618,6 +655,12 @@ class StockDataFetcher:
 
         for idx, board_name in enumerate(board_names, start=1):
             if pending and pending.issubset(found_codes):
+                break
+            if time.time() - started_at >= self.concept_fill_timeout_sec:
+                if self._log:
+                    self._log(
+                        f"概念补全达到 {self.concept_fill_timeout_sec:.0f}s 超时上限，提前结束本轮。"
+                    )
                 break
             try:
                 cons = _call_akshare_quietly(ak.stock_board_concept_cons_em, symbol=board_name)
@@ -647,9 +690,20 @@ class StockDataFetcher:
                     f"概念板块进度 {idx}/{total}: {board_name}，已命中 {len(concept_map)} / {len(pending)} 只"
                 )
 
-        for code, names in concept_map.items():
-            cache[code] = _normalize_concepts_text("、".join(names))
-        return {code: cache.get(code, "") for code in target_set}
+        with self._concepts_lock:
+            for code, names in concept_map.items():
+                self._concepts_cache[code] = _normalize_concepts_text("、".join(names))
+            return {code: self._concepts_cache.get(code, "") for code in target_set}
+
+    def preload_stock_concepts(
+        self,
+        stock_codes: List[str],
+        max_boards: Optional[int] = None,
+    ) -> Dict[str, str]:
+        target_codes = [_norm_code(code) for code in stock_codes if _norm_code(code)]
+        if not target_codes:
+            return {}
+        return self._load_concepts_map(target_codes, max_boards=max_boards)
 
     def _set_universe_concepts_cache(self, df: pd.DataFrame) -> None:
         cache: Dict[str, str] = {}
@@ -725,9 +779,16 @@ class StockDataFetcher:
         if not force_refresh:
             cached = _load_fund_flow_store(code, min_rows=min_rows, log=self._log)
             if cached is not None and not cached.empty:
-                if not _should_refresh_today_row(cached):
+                has_big_order_data = False
+                if "big_order_amount" in cached.columns:
+                    big_order_series = pd.to_numeric(cached["big_order_amount"], errors="coerce")
+                    has_big_order_data = bool(big_order_series.notna().any())
+                if has_big_order_data and not _should_refresh_today_row(cached):
                     return cached.tail(days).reset_index(drop=True)
-                if self._log:
+                if not has_big_order_data:
+                    if self._log:
+                        self._log(f"资金流 {code} 缓存缺少大单净额，自动刷新最新数据。")
+                elif self._log:
                     self._log(f"资金流 {code} 命中当天缓存，但尚未收盘，改为刷新最新数据。")
         market = _infer_market(code)
         try:
@@ -738,21 +799,51 @@ class StockDataFetcher:
             return None
         if flow_df is None or flow_df.empty:
             return None
-        df = flow_df.rename(
-            columns={
-                "日期": "date",
-                "收盘价": "close",
-                "涨跌幅": "change_pct",
-                "主力净流入-净额": "main_force_amount",
-                "主力净流入-净占比": "main_force_ratio",
-                "大单净流入-净额": "big_order_amount",
-                "大单净流入-净占比": "big_order_ratio",
-                "超大单净流入-净额": "super_big_order_amount",
-                "超大单净流入-净占比": "super_big_order_ratio",
-            }
-        ).copy()
+        source_columns = [str(col) for col in flow_df.columns.tolist()]
+        rename_map: Dict[str, str] = {}
+
+        date_col = _first_existing_column(source_columns, ["日期", "交易日", "date"])
+        close_col = _first_existing_column(source_columns, ["收盘价", "收盘", "close"])
+        change_pct_col = _first_existing_column(source_columns, ["涨跌幅", "change_pct"])
+        main_amount_col = _first_existing_column(source_columns, ["主力净流入-净额", "主力净额"])
+        main_ratio_col = _first_existing_column(source_columns, ["主力净流入-净占比", "主力净占比"])
+        big_amount_col = _first_existing_column(source_columns, ["大单净流入-净额", "大单净额"])
+        big_ratio_col = _first_existing_column(source_columns, ["大单净流入-净占比", "大单净占比"])
+        super_amount_col = _first_existing_column(source_columns, ["超大单净流入-净额", "超大单净额"])
+        super_ratio_col = _first_existing_column(source_columns, ["超大单净流入-净占比", "超大单净占比"])
+
+        if main_amount_col is None:
+            main_amount_col = _find_fund_flow_column(source_columns, ["主力", "净", "额"], excludes=["占比"])
+        if big_amount_col is None:
+            big_amount_col = _find_fund_flow_column(source_columns, ["大单", "净", "额"], excludes=["占比", "超大单"])
+        if super_amount_col is None:
+            super_amount_col = _find_fund_flow_column(source_columns, ["超大单", "净", "额"], excludes=["占比"])
+        if main_ratio_col is None:
+            main_ratio_col = _find_fund_flow_column(source_columns, ["主力", "净", "占比"])
+        if big_ratio_col is None:
+            big_ratio_col = _find_fund_flow_column(source_columns, ["大单", "净", "占比"], excludes=["超大单"])
+        if super_ratio_col is None:
+            super_ratio_col = _find_fund_flow_column(source_columns, ["超大单", "净", "占比"])
+
+        for src, dst in [
+            (date_col, "date"),
+            (close_col, "close"),
+            (change_pct_col, "change_pct"),
+            (main_amount_col, "main_force_amount"),
+            (main_ratio_col, "main_force_ratio"),
+            (big_amount_col, "big_order_amount"),
+            (big_ratio_col, "big_order_ratio"),
+            (super_amount_col, "super_big_order_amount"),
+            (super_ratio_col, "super_big_order_ratio"),
+        ]:
+            if src:
+                rename_map[src] = dst
+
+        df = flow_df.rename(columns=rename_map).copy()
         if "date" not in df.columns:
             return None
+        if "big_order_amount" not in df.columns and self._log:
+            self._log(f"个股资金流 {code} 未匹配到大单净额字段，返回列: {', '.join(source_columns)}")
         df["date"] = df["date"].astype(str).str.strip()
         for col in [
             "close",
@@ -916,8 +1007,81 @@ class StockDataFetcher:
             print(f"获取股票 {stock_code} 历史数据失败: {e}")
             return None
 
-            df = _retry_ak_call(ak.stock_fund_flow_individual, symbol="即时")
-            return df
-        except Exception as e:
-            print(f"获取个股资金流向排名失败: {e}")
+    def get_intraday_data(self, stock_code: str) -> Optional[pd.DataFrame]:
+        code = str(stock_code or "").strip().zfill(6)
+        if not code:
             return None
+
+        raw = None
+        last_error: Optional[Exception] = None
+
+        try:
+            raw = _retry_ak_call(ak.stock_zh_a_hist_min_em, symbol=code, period="1", adjust="")
+        except Exception as e:
+            last_error = e
+            if self._log:
+                self._log(f"分时行情(主接口) {code} 获取失败: {e}")
+
+        if raw is None or getattr(raw, "empty", True):
+            try:
+                raw = _retry_ak_call(ak.stock_zh_a_minute, symbol=code, period="1")
+            except Exception as e:
+                last_error = e
+                if self._log:
+                    self._log(f"分时行情(备用接口) {code} 获取失败: {e}")
+
+        if raw is None or getattr(raw, "empty", True):
+            if self._log and last_error is not None:
+                self._log(f"分时行情 {code} 无可用数据: {last_error}")
+            return None
+
+        source_columns = [str(col) for col in raw.columns.tolist()]
+        rename_map: Dict[str, str] = {}
+        time_col = _first_existing_column(source_columns, ["时间", "日期时间", "datetime", "time"])
+        open_col = _first_existing_column(source_columns, ["开盘", "open"])
+        close_col = _first_existing_column(source_columns, ["收盘", "close", "最新价"])
+        high_col = _first_existing_column(source_columns, ["最高", "high"])
+        low_col = _first_existing_column(source_columns, ["最低", "low"])
+        volume_col = _first_existing_column(source_columns, ["成交量", "volume"])
+        amount_col = _first_existing_column(source_columns, ["成交额", "amount"])
+
+        for src, dst in [
+            (time_col, "time"),
+            (open_col, "open"),
+            (close_col, "close"),
+            (high_col, "high"),
+            (low_col, "low"),
+            (volume_col, "volume"),
+            (amount_col, "amount"),
+        ]:
+            if src:
+                rename_map[src] = dst
+
+        df = raw.rename(columns=rename_map).copy()
+        if "time" not in df.columns:
+            if self._log:
+                self._log(f"分时行情 {code} 缺少时间列，返回列: {', '.join(source_columns)}")
+            return None
+
+        df["time"] = pd.to_datetime(df["time"], errors="coerce")
+        df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+        if df.empty:
+            return None
+
+        # Some providers return multiple trading days in one payload.
+        # Keep only the latest trading date for intraday rendering.
+        latest_trade_date = df["time"].dt.date.max()
+        if latest_trade_date is not None:
+            df = df[df["time"].dt.date == latest_trade_date].reset_index(drop=True)
+        if df.empty:
+            return None
+
+        for col in ["open", "close", "high", "low", "volume", "amount"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            else:
+                df[col] = None
+
+        if len(df) > 300:
+            df = df.tail(300).reset_index(drop=True)
+        return df[["time", "open", "close", "high", "low", "volume", "amount"]]
