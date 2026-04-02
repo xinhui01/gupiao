@@ -37,13 +37,13 @@ def _history_request_concurrency() -> int:
 _HISTORY_REQUEST_SEMAPHORE = threading.BoundedSemaphore(_history_request_concurrency())
 _EASTMONEY_HISTORY_MIRRORS = [
     "https://push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://push2.eastmoney.com/api/qt/stock/kline/get",
-    "https://82.push2.eastmoney.com/api/qt/stock/kline/get",
-    "https://33.push2.eastmoney.com/api/qt/stock/kline/get",
-    "https://7.push2.eastmoney.com/api/qt/stock/kline/get",
-    "https://81.push2.eastmoney.com/api/qt/stock/kline/get",
-    "https://72.push2.eastmoney.com/api/qt/stock/kline/get",
-    "https://28.push2.eastmoney.com/api/qt/stock/kline/get",
+    "https://1.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://7.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://28.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://33.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://45.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://58.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://72.push2his.eastmoney.com/api/qt/stock/kline/get",
 ]
 
 # 东方财富接口常校验 Referer / UA；缺省时易被直接断开连接
