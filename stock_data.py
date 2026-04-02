@@ -34,6 +34,51 @@ def _history_request_concurrency() -> int:
     return max(1, min(value, 8))
 
 
+def _history_connect_timeout_sec() -> float:
+    raw = os.environ.get("GUPPIAO_HISTORY_CONNECT_TIMEOUT_SEC", "").strip()
+    try:
+        value = float(raw) if raw else 2.5
+    except ValueError:
+        value = 2.5
+    return max(0.5, min(value, 10.0))
+
+
+def _history_read_timeout_sec() -> float:
+    raw = os.environ.get("GUPPIAO_HISTORY_READ_TIMEOUT_SEC", "").strip()
+    try:
+        value = float(raw) if raw else 4.0
+    except ValueError:
+        value = 4.0
+    return max(1.0, min(value, 15.0))
+
+
+def _history_total_timeout_sec() -> float:
+    raw = os.environ.get("GUPPIAO_HISTORY_TOTAL_TIMEOUT_SEC", "").strip()
+    try:
+        value = float(raw) if raw else 12.0
+    except ValueError:
+        value = 12.0
+    return max(3.0, min(value, 60.0))
+
+
+def _history_host_cooldown_sec() -> float:
+    raw = os.environ.get("GUPPIAO_HISTORY_HOST_COOLDOWN_SEC", "").strip()
+    try:
+        value = float(raw) if raw else 180.0
+    except ValueError:
+        value = 180.0
+    return max(10.0, min(value, 1800.0))
+
+
+def _history_max_mirrors_per_stock() -> int:
+    raw = os.environ.get("GUPPIAO_HISTORY_MAX_MIRRORS_PER_STOCK", "").strip()
+    try:
+        value = int(raw) if raw else 3
+    except ValueError:
+        value = 3
+    return max(1, min(value, 8))
+
+
 _HISTORY_REQUEST_SEMAPHORE = threading.BoundedSemaphore(_history_request_concurrency())
 _EASTMONEY_HISTORY_MIRRORS = [
     "https://push2his.eastmoney.com/api/qt/stock/kline/get",
@@ -45,6 +90,8 @@ _EASTMONEY_HISTORY_MIRRORS = [
     "https://58.push2his.eastmoney.com/api/qt/stock/kline/get",
     "https://72.push2his.eastmoney.com/api/qt/stock/kline/get",
 ]
+_HISTORY_MIRROR_HEALTH: Dict[str, float] = {}
+_HISTORY_MIRROR_HEALTH_LOCK = threading.Lock()
 
 # 东方财富接口常校验 Referer / UA；缺省时易被直接断开连接
 _EASTMONEY_HEADERS = {
@@ -91,6 +138,17 @@ def _is_transient_network_error(exc: BaseException) -> bool:
     if "timed out" in r.lower():
         return True
     return False
+
+
+def _is_name_resolution_error(exc: BaseException) -> bool:
+    text = repr(exc)
+    lowered = text.lower()
+    return (
+        "nameresolutionerror" in lowered
+        or "failed to resolve" in lowered
+        or "nodename nor servname provided" in lowered
+        or "temporary failure in name resolution" in lowered
+    )
 
 
 def _retry_ak_call(fn: Callable[..., T], *args, retries: int = 5, base_delay: float = 1.2, **kwargs) -> T:
@@ -143,6 +201,72 @@ def _request_session_get_json(url: str, params: Dict[str, Any], timeout: Tuple[i
         response = session.get(**req_kw)
         response.raise_for_status()
         return response.json()
+
+
+def _history_mirror_host(url: str) -> str:
+    text = re.sub(r"^https?://", "", str(url or "").strip())
+    return text.split("/", 1)[0]
+
+
+def _mark_history_mirror_failed(url: str) -> None:
+    host = _history_mirror_host(url)
+    if not host:
+        return
+    cooldown_until = time.time() + _history_host_cooldown_sec()
+    with _HISTORY_MIRROR_HEALTH_LOCK:
+        _HISTORY_MIRROR_HEALTH[host] = cooldown_until
+
+
+def _mark_history_mirror_ok(url: str) -> None:
+    host = _history_mirror_host(url)
+    if not host:
+        return
+    with _HISTORY_MIRROR_HEALTH_LOCK:
+        _HISTORY_MIRROR_HEALTH.pop(host, None)
+
+
+def _history_mirror_on_cooldown(url: str, now: Optional[float] = None) -> bool:
+    host = _history_mirror_host(url)
+    if not host:
+        return False
+    current = time.time() if now is None else now
+    with _HISTORY_MIRROR_HEALTH_LOCK:
+        cooldown_until = _HISTORY_MIRROR_HEALTH.get(host, 0.0)
+        if cooldown_until <= current:
+            if host in _HISTORY_MIRROR_HEALTH:
+                _HISTORY_MIRROR_HEALTH.pop(host, None)
+            return False
+        return True
+
+
+def _prioritize_history_mirrors(
+    mirror_urls: List[str],
+    preferred_mirror: Optional[str] = None,
+) -> List[str]:
+    now = time.time()
+    ordered: List[str] = []
+    seen: set[str] = set()
+
+    candidates = []
+    if preferred_mirror:
+        candidates.append(preferred_mirror)
+    candidates.extend(mirror_urls)
+
+    healthy: List[str] = []
+    cooling: List[str] = []
+    for url in candidates:
+        clean = str(url or "").strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        if _history_mirror_on_cooldown(clean, now):
+            cooling.append(clean)
+        else:
+            healthy.append(clean)
+
+    ordered.extend(healthy)
+    ordered.extend(cooling)
+    return ordered[: _history_max_mirrors_per_stock()]
 
 
 def _parse_eastmoney_hist_json(stock_code: str, data_json: Dict[str, Any]) -> "pd.DataFrame":
@@ -203,14 +327,21 @@ def _probe_history_mirror(url: str) -> Tuple[bool, str]:
     start_date = (datetime.now() - timedelta(days=40)).strftime("%Y%m%d")
     params = _eastmoney_history_request_params(probe_code, start_date, end_date)
     try:
-        data_json = _request_session_get_json(url, params=params, timeout=(4, 6))
+        data_json = _request_session_get_json(
+            url,
+            params=params,
+            timeout=(_history_connect_timeout_sec(), _history_read_timeout_sec()),
+        )
         df = _parse_eastmoney_hist_json(probe_code, data_json)
         if df.empty:
+            _mark_history_mirror_failed(url)
             return False, "empty"
         latest_series = df["日期"].dropna()
         latest_date = str(latest_series.iloc[-1]) if not latest_series.empty else "unknown"
+        _mark_history_mirror_ok(url)
         return True, latest_date
     except Exception as e:
+        _mark_history_mirror_failed(url)
         return False, str(e)
 
 
@@ -220,23 +351,42 @@ def _fetch_eastmoney_hist_frame(
     start_date: str,
     end_date: str,
     mirror_urls: Optional[List[str]] = None,
+    log: Optional[Callable[[str], None]] = None,
 ) -> "pd.DataFrame":
     """直接抓东方财富历史日线，并在多个镜像间轮换。"""
-    import random
-
     params = _eastmoney_history_request_params(stock_code, start_date, end_date)
     mirrors = list(mirror_urls or _EASTMONEY_HISTORY_MIRRORS)
     last_exception: Optional[BaseException] = None
+    deadline = time.time() + _history_total_timeout_sec()
 
     for base_url in mirrors:
-        for attempt in range(2):
-            try:
-                data_json = _request_session_get_json(base_url, params=params, timeout=(4, 8))
-                return _parse_eastmoney_hist_json(stock_code, data_json)
-            except Exception as e:
-                last_exception = e
-                if attempt < 1:
-                    time.sleep(0.6 + random.uniform(0.2, 0.5))
+        host = _history_mirror_host(base_url)
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        try:
+            connect_timeout = min(_history_connect_timeout_sec(), max(0.5, remaining))
+            read_timeout = min(_history_read_timeout_sec(), max(1.0, remaining))
+            data_json = _request_session_get_json(
+                base_url,
+                params=params,
+                timeout=(connect_timeout, read_timeout),
+            )
+            df = _parse_eastmoney_hist_json(stock_code, data_json)
+            if df.empty:
+                err = RuntimeError(f"{host} 返回空历史数据")
+                last_exception = err
+                _mark_history_mirror_failed(base_url)
+                if log:
+                    log(f"历史 {stock_code} 镜像 {host} 返回空数据，切换下一个镜像。")
+                continue
+            _mark_history_mirror_ok(base_url)
+            return df
+        except Exception as e:
+            last_exception = e
+            _mark_history_mirror_failed(base_url)
+            if log:
+                log(f"历史 {stock_code} 镜像 {host} 失败: {e}，切换下一个镜像。")
     if last_exception is not None:
         raise last_exception
     return pd.DataFrame()
@@ -758,6 +908,7 @@ class StockDataFetcher:
             configured_timeout = 25.0
         self.concept_fill_timeout_sec: float = max(5.0, configured_timeout)
         self._concepts_lock = threading.Lock()
+        self._last_history_probe_failures: Dict[str, str] = {}
 
     def set_log_callback(self, cb: Optional[Callable[[str], None]]) -> None:
         self._log = cb
@@ -768,6 +919,7 @@ class StockDataFetcher:
             return list(self._history_mirror_cache)
 
         available: List[str] = []
+        failures: Dict[str, str] = {}
         if self._log:
             self._log("开始检测东方财富历史接口镜像可用性...")
         for url in _EASTMONEY_HISTORY_MIRRORS:
@@ -777,11 +929,21 @@ class StockDataFetcher:
                 available.append(url)
                 if self._log:
                     self._log(f"历史镜像可用 {host}，最新日期 {detail}")
-            elif self._log:
-                self._log(f"历史镜像不可用 {host}：{detail}")
+            else:
+                failures[host] = str(detail)
+                if self._log:
+                    self._log(f"历史镜像不可用 {host}：{detail}")
         self._history_mirror_cache = available
         self._history_mirror_checked_at = now
+        self._last_history_probe_failures = failures
+        if not available and self._log and failures:
+            dns_failed = sum(1 for detail in failures.values() if _is_name_resolution_error(RuntimeError(detail)))
+            if dns_failed == len(failures):
+                self._log("历史镜像全部失败，且都属于 DNS 解析失败；当前更像是本机网络/解析环境异常，不是单个镜像故障。")
         return list(available)
+
+    def get_last_history_probe_failures(self) -> Dict[str, str]:
+        return dict(self._last_history_probe_failures)
 
 
     def clear_saved_universe_data(self) -> None:
@@ -1152,8 +1314,10 @@ class StockDataFetcher:
 
             start_date = (datetime.now() - timedelta(days=days + 15)).strftime('%Y%m%d')
             selected_mirrors = [x for x in (mirror_pool or self.get_available_history_mirrors()) if x]
-            if preferred_mirror:
-                selected_mirrors = [preferred_mirror] + [x for x in selected_mirrors if x != preferred_mirror]
+            selected_mirrors = _prioritize_history_mirrors(
+                selected_mirrors,
+                preferred_mirror=preferred_mirror,
+            )
             if not selected_mirrors:
                 if history_df is not None and not history_df.empty:
                     if self._log:
@@ -1168,6 +1332,7 @@ class StockDataFetcher:
                 start_date,
                 end_date,
                 selected_mirrors,
+                self._log,
             )
             
             if df.empty:
@@ -1213,6 +1378,8 @@ class StockDataFetcher:
                 if self._log:
                     self._log(f"历史 {stock_code} 刷新失败，回退本地缓存: {e}")
                 return history_df.tail(days).reset_index(drop=True)
+            if self._log:
+                self._log(f"历史 {stock_code} 获取失败: {e}")
             print(f"获取股票 {stock_code} 历史数据失败: {e}")
             return None
 

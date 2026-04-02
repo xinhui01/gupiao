@@ -427,16 +427,20 @@ class StockFilter:
         available_mirrors = self.fetcher.get_available_history_mirrors(force_refresh=True)
         if not available_mirrors:
             if log:
-                log("历史接口镜像全部不可用，本次扫描已停止。")
-            return []
+                failures = self.fetcher.get_last_history_probe_failures()
+                if failures:
+                    sample = "；".join(f"{host}: {detail}" for host, detail in list(failures.items())[:3])
+                    log(f"历史接口镜像全部不可用，最近探测失败示例：{sample}")
+                log("历史接口镜像不可用，已切换为仅使用本地历史缓存扫描；未缓存到本地的股票会被快速跳过。")
 
         rows = subset.to_dict("records")
         random.Random(int(time.time())).shuffle(rows)
         assigned_jobs = []
         mirror_counts: Dict[str, int] = {}
         for idx, row in enumerate(rows):
-            mirror = available_mirrors[idx % len(available_mirrors)]
-            mirror_counts[mirror] = mirror_counts.get(mirror, 0) + 1
+            mirror = available_mirrors[idx % len(available_mirrors)] if available_mirrors else None
+            if mirror:
+                mirror_counts[mirror] = mirror_counts.get(mirror, 0) + 1
             assigned_jobs.append((row, mirror))
 
         if log:
@@ -444,11 +448,15 @@ class StockFilter:
                 f"【阶段 2/3】股票池 {total_universe} 只，本次扫描 {total} 只，最近{self.trend_days}日收盘 > MA{self.ma_period}，并发 {workers} 线程。"
             )
             log("说明：扫描阶段只拉历史日线，不拉实时、资金流或内外盘。")
-            mirror_summary = "，".join(
-                f"{mirror.split('//', 1)[-1].split('/', 1)[0]}={mirror_counts.get(mirror, 0)}"
-                for mirror in available_mirrors
-            )
-            log(f"历史镜像分区：{mirror_summary}")
+            log("说明：单只股票历史数据会在少量镜像间快速切换，失败节点会短时冷却，避免长时间卡死。")
+            if available_mirrors:
+                mirror_summary = "，".join(
+                    f"{mirror.split('//', 1)[-1].split('/', 1)[0]}={mirror_counts.get(mirror, 0)}"
+                    for mirror in available_mirrors
+                )
+                log(f"历史镜像分区：{mirror_summary}")
+            else:
+                log("历史镜像分区：当前无可用镜像，本轮仅尝试读取 data/stock_store.sqlite3 中已缓存的历史数据。")
 
         results: List[Dict[str, Any]] = []
         completed = 0
@@ -492,7 +500,11 @@ class StockFilter:
                     if log and now - last_report >= 10:
                         elapsed = now - t0
                         sample = [
-                            f"{future_to_meta[f][0]}@{future_to_meta[f][4].split('//', 1)[-1].split('/', 1)[0]}"
+                            (
+                                f"{future_to_meta[f][0]}@{future_to_meta[f][4].split('//', 1)[-1].split('/', 1)[0]}"
+                                if future_to_meta[f][4]
+                                else f"{future_to_meta[f][0]}@cache-only"
+                            )
                             for f in list(pending)[:3]
                         ]
                         sample_text = "、".join(sample) if sample else "-"
@@ -515,7 +527,7 @@ class StockFilter:
                     except Exception as e:
                         if log:
                             log(
-                                f"  {code} {name} 检测异常[{mirror.split('//', 1)[-1].split('/', 1)[0]}]: {e}"
+                                f"  {code} {name} 检测异常[{mirror.split('//', 1)[-1].split('/', 1)[0] if mirror else 'cache-only'}]: {e}"
                             )
                         filter_result = {
                             "code": code,
@@ -552,7 +564,7 @@ class StockFilter:
                         elapsed = now - t0
                         log(
                             f"进度 {completed}/{total}，命中 {len(results)} 只，已用时 {elapsed:.1f}s，"
-                            f"当前 {code} {name} @ {mirror.split('//', 1)[-1].split('/', 1)[0]}"
+                            f"当前 {code} {name} @ {mirror.split('//', 1)[-1].split('/', 1)[0] if mirror else 'cache-only'}"
                         )
                         last_report = now
         finally:
