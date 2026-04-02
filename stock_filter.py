@@ -431,7 +431,8 @@ class StockFilter:
                 if failures:
                     sample = "；".join(f"{host}: {detail}" for host, detail in list(failures.items())[:3])
                     log(f"历史接口镜像全部不可用，最近探测失败示例：{sample}")
-                log("历史接口镜像不可用，已切换为仅使用本地历史缓存扫描；未缓存到本地的股票会被快速跳过。")
+                log("历史接口镜像全部不可用，本轮扫描已停止。")
+            return []
 
         rows = subset.to_dict("records")
         random.Random(int(time.time())).shuffle(rows)
@@ -449,14 +450,11 @@ class StockFilter:
             )
             log("说明：扫描阶段只拉历史日线，不拉实时、资金流或内外盘。")
             log("说明：单只股票历史数据会在少量镜像间快速切换，失败节点会短时冷却，避免长时间卡死。")
-            if available_mirrors:
-                mirror_summary = "，".join(
-                    f"{mirror.split('//', 1)[-1].split('/', 1)[0]}={mirror_counts.get(mirror, 0)}"
-                    for mirror in available_mirrors
-                )
-                log(f"历史镜像分区：{mirror_summary}")
-            else:
-                log("历史镜像分区：当前无可用镜像，本轮仅尝试读取 data/stock_store.sqlite3 中已缓存的历史数据。")
+            mirror_summary = "，".join(
+                f"{mirror.split('//', 1)[-1].split('/', 1)[0]}={mirror_counts.get(mirror, 0)}"
+                for mirror in available_mirrors
+            )
+            log(f"历史镜像分区：{mirror_summary}")
 
         results: List[Dict[str, Any]] = []
         completed = 0

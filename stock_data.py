@@ -244,7 +244,6 @@ def _prioritize_history_mirrors(
     preferred_mirror: Optional[str] = None,
 ) -> List[str]:
     now = time.time()
-    ordered: List[str] = []
     seen: set[str] = set()
 
     candidates = []
@@ -264,9 +263,8 @@ def _prioritize_history_mirrors(
         else:
             healthy.append(clean)
 
-    ordered.extend(healthy)
-    ordered.extend(cooling)
-    return ordered[: _history_max_mirrors_per_stock()]
+    # 冷却中的镜像直接剔除，避免“明知不可用还继续打”。
+    return healthy[: _history_max_mirrors_per_stock()]
 
 
 def _parse_eastmoney_hist_json(stock_code: str, data_json: Dict[str, Any]) -> "pd.DataFrame":
