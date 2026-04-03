@@ -19,6 +19,7 @@ from matplotlib.figure import Figure
 from matplotlib.ticker import FuncFormatter
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 
+from scan_models import FilterSettings, ScanRequest
 from stock_filter import StockFilter
 from stock_data import clear_history_data, clear_universe_data
 from stock_store import ensure_store_ready, load_latest_scan_snapshot, load_scan_snapshot, save_scan_snapshot
@@ -49,6 +50,8 @@ class StockMonitorApp:
         self.sort_column = "five_day_return"
         self.sort_reverse = True
         self.is_scanning = False
+        self._scan_thread: Optional[threading.Thread] = None
+        self._active_scan_request: Optional[ScanRequest] = None
         self._run_log_file: Optional[Path] = None
         self._current_scan_allowed_boards: List[str] = []
         self._current_scan_max_stocks: int = 0
@@ -673,6 +676,111 @@ class StockMonitorApp:
         boards = [board for board, var in self.board_filter_vars.items() if var.get()]
         return boards or list(self.board_filter_vars.keys())
 
+    def _parse_int_value(
+        self,
+        raw_value: str,
+        field_name: str,
+        minimum: int,
+        maximum: Optional[int] = None,
+        allow_zero: bool = False,
+    ) -> int:
+        text = str(raw_value).strip()
+        try:
+            value = int(text)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} 必须是整数") from exc
+        if allow_zero and value == 0:
+            return 0
+        if value < minimum:
+            raise ValueError(f"{field_name} 不能小于 {minimum}")
+        if maximum is not None and value > maximum:
+            raise ValueError(f"{field_name} 不能大于 {maximum}")
+        return value
+
+    def _parse_float_value(
+        self,
+        raw_value: str,
+        field_name: str,
+        minimum: float,
+        maximum: Optional[float] = None,
+    ) -> float:
+        text = str(raw_value).strip()
+        try:
+            value = float(text)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} 必须是数字") from exc
+        if value < minimum:
+            raise ValueError(f"{field_name} 不能小于 {minimum:g}")
+        if maximum is not None and value > maximum:
+            raise ValueError(f"{field_name} 不能大于 {maximum:g}")
+        return value
+
+    def _build_filter_settings(self) -> FilterSettings:
+        return FilterSettings(
+            trend_days=self._parse_int_value(self.trend_days_var.get(), "连续天数", minimum=1, maximum=120),
+            ma_period=self._parse_int_value(self.ma_period_var.get(), "MA周期", minimum=1, maximum=250),
+            limit_up_lookback_days=self._parse_int_value(
+                self.limit_up_lookback_var.get(),
+                "近N日涨停",
+                minimum=1,
+                maximum=60,
+            ),
+            volume_lookback_days=self._parse_int_value(
+                self.volume_lookback_var.get(),
+                "放量观察天数",
+                minimum=1,
+                maximum=60,
+            ),
+            volume_expand_enabled=bool(self.volume_expand_enabled_var.get()),
+            volume_expand_factor=self._parse_float_value(
+                self.volume_expand_factor_var.get(),
+                "放量倍数阈值",
+                minimum=1.0,
+                maximum=50.0,
+            ),
+            require_limit_up_within_days=bool(self.require_limit_up_var.get()),
+        )
+
+    def _apply_filter_settings_from_ui(self, show_error: bool = True) -> Optional[FilterSettings]:
+        try:
+            settings = self._build_filter_settings()
+        except ValueError as exc:
+            if show_error:
+                messagebox.showerror("错误", str(exc))
+            return None
+        self.stock_filter.apply_settings(settings)
+        return settings
+
+    def _build_scan_request(self) -> Optional[ScanRequest]:
+        settings = self._apply_filter_settings_from_ui(show_error=True)
+        if settings is None:
+            return None
+        try:
+            max_stocks = self._parse_int_value(
+                self.scan_count_var.get(),
+                "扫描数量",
+                minimum=1,
+                maximum=10000,
+                allow_zero=True,
+            )
+            scan_workers = self._parse_int_value(
+                self.scan_workers_var.get(),
+                "并发线程",
+                minimum=1,
+                maximum=16,
+            )
+        except ValueError as exc:
+            messagebox.showerror("错误", str(exc))
+            return None
+        return ScanRequest(
+            filter_settings=settings,
+            max_stocks=max_stocks,
+            scan_workers=scan_workers,
+            allowed_boards=tuple(self._selected_boards()),
+            refresh_universe=bool(self.refresh_universe_var.get()),
+            ignore_result_snapshot=bool(self.ignore_result_snapshot_var.get()),
+        )
+
     def _short_text(self, value: Any, max_len: int = 28) -> str:
         text = str(value or "").strip()
         if not text or text == "-":
@@ -743,20 +851,15 @@ class StockMonitorApp:
         self.update_result_table(filtered, announce=False, persist=False)
         self.status_var.set(f"已按板块筛选，当前显示 {len(filtered)} 只")
 
-    def _scan_signature(self, allowed_boards: List[str], max_stocks: int) -> Dict[str, Any]:
-        return {
-            "trend_days": int(self.stock_filter.trend_days),
-            "ma_period": int(self.stock_filter.ma_period),
-            "limit_up_lookback_days": int(self.stock_filter.limit_up_lookback_days),
-            "volume_lookback_days": int(self.stock_filter.volume_lookback_days),
-            "volume_expand_enabled": bool(self.stock_filter.volume_expand_enabled),
-            "volume_expand_factor": float(self.stock_filter.volume_expand_factor),
-            "require_limit_up_within_days": bool(self.stock_filter.require_limit_up_within_days),
-            "allowed_boards": sorted({str(x).strip() for x in allowed_boards if str(x).strip()}),
-            "max_stocks": int(max_stocks),
-        }
+    def _scan_signature(self, request: ScanRequest) -> Dict[str, Any]:
+        return request.to_signature()
 
-    def _save_last_results(self, results: List[Dict[str, Any]], complete: bool = True) -> None:
+    def _save_last_results(
+        self,
+        results: List[Dict[str, Any]],
+        complete: bool = True,
+        request: Optional[ScanRequest] = None,
+    ) -> None:
         payload_results = []
         for result in results:
             data = result.get("data", {}) or {}
@@ -774,12 +877,20 @@ class StockMonitorApp:
                     },
                 }
             )
+        signature_request = request or self._active_scan_request
+        if signature_request is None:
+            current_settings = self.stock_filter.get_settings()
+            signature_request = ScanRequest(
+                filter_settings=current_settings,
+                max_stocks=int(self._current_scan_max_stocks),
+                allowed_boards=tuple(self._current_scan_allowed_boards),
+            )
         payload = {
             "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "scan_date": datetime.now().strftime("%Y-%m-%d"),
             "complete": bool(complete),
             "row_count": len(payload_results),
-            "signature": self._scan_signature(self._current_scan_allowed_boards, self._current_scan_max_stocks),
+            "signature": self._scan_signature(signature_request),
             "results": payload_results,
         }
         save_scan_snapshot(json.dumps(payload["signature"], ensure_ascii=False, sort_keys=True), payload)
@@ -795,53 +906,39 @@ class StockMonitorApp:
         self.update_result_table(results, announce=False, persist=False)
         self.status_var.set("已从本地结果恢复")
 
-    def _can_use_snapshot(self, allowed_boards: List[str], max_stocks: int) -> bool:
-        if self.ignore_result_snapshot_var.get():
+    def _can_use_snapshot(self, request: ScanRequest) -> bool:
+        if request.ignore_result_snapshot:
             return False
-        if self.refresh_universe_var.get():
+        if request.refresh_universe:
             return False
-        signature = self._scan_signature(allowed_boards, max_stocks)
+        signature = self._scan_signature(request)
         payload = load_scan_snapshot(json.dumps(signature, ensure_ascii=False, sort_keys=True))
         return bool(payload and payload.get("complete") and payload.get("results"))
 
     def update_filter_params(self) -> bool:
-        try:
-            self.stock_filter.trend_days = max(1, int(self.trend_days_var.get()))
-            self.stock_filter.ma_period = max(1, int(self.ma_period_var.get()))
-            self.stock_filter.limit_up_lookback_days = max(1, int(self.limit_up_lookback_var.get()))
-            self.stock_filter.volume_lookback_days = max(1, int(self.volume_lookback_var.get()))
-            self.stock_filter.volume_expand_enabled = bool(self.volume_expand_enabled_var.get())
-            self.stock_filter.volume_expand_factor = max(1.0, float(self.volume_expand_factor_var.get()))
-            self.stock_filter.require_limit_up_within_days = bool(self.require_limit_up_var.get())
-            return True
-        except ValueError:
-            messagebox.showerror("错误", "参数无效")
-            return False
+        return self._apply_filter_settings_from_ui(show_error=True) is not None
 
     def start_scan(self):
-        if not self.update_filter_params():
-            return
         if self.is_scanning:
             return
+        request = self._build_scan_request()
+        if request is None:
+            return
 
-        try:
-            max_stocks = int(self.scan_count_var.get())
-        except ValueError:
-            max_stocks = 0
-        allowed_boards = self._selected_boards()
-        self._current_scan_allowed_boards = allowed_boards
-        self._current_scan_max_stocks = max_stocks
+        self._active_scan_request = request
+        self._current_scan_allowed_boards = list(request.allowed_boards)
+        self._current_scan_max_stocks = int(request.max_stocks)
 
-        if self._can_use_snapshot(allowed_boards, max_stocks):
+        if self._can_use_snapshot(request):
             self._log("命中本地结果快照，直接恢复上次扫描结果。")
-            signature = json.dumps(self._scan_signature(allowed_boards, max_stocks), ensure_ascii=False, sort_keys=True)
+            signature = json.dumps(self._scan_signature(request), ensure_ascii=False, sort_keys=True)
             payload = load_scan_snapshot(signature)
             if payload:
                 self.all_scan_results = payload.get("results", []) or []
                 self.update_result_table(self.all_scan_results, announce=False, persist=False)
                 self.status_var.set("已从本地结果恢复")
                 self.progress_var.set(100)
-                self.scan_finished()
+                self.scan_finished("已从本地结果恢复")
                 return
 
         self.is_scanning = True
@@ -854,35 +951,28 @@ class StockMonitorApp:
 
         self._open_run_log()
         self._log(
-            f"开始扫描：最近{self.stock_filter.trend_days}日收盘 > MA{self.stock_filter.ma_period}，"
-            f"近{self.stock_filter.limit_up_lookback_days}日内涨停过滤={'开' if self.stock_filter.require_limit_up_within_days else '关'}。"
+            f"开始扫描：最近{request.filter_settings.trend_days}日收盘 > MA{request.filter_settings.ma_period}，"
+            f"近{request.filter_settings.limit_up_lookback_days}日内涨停过滤={'开' if request.filter_settings.require_limit_up_within_days else '关'}。"
         )
         self._log("扫描阶段只拉历史日线，不拉实时、资金流或内外盘。")
         self.status_var.set("正在扫描...")
         self.progress_var.set(0)
 
-        scan_thread = threading.Thread(target=self.scan_stocks, daemon=True)
-        scan_thread.start()
+        self._scan_thread = threading.Thread(target=self.scan_stocks, args=(request,), daemon=True)
+        self._scan_thread.start()
 
     def stop_scan(self):
         self.is_scanning = False
         self.status_var.set("正在停止...")
         self._log("已请求停止，正在等待当前任务结束。")
 
-    def scan_stocks(self):
+    def scan_stocks(self, request: ScanRequest):
         try:
-            try:
-                max_stocks = int(self.scan_count_var.get())
-            except ValueError:
-                max_stocks = 0
-            try:
-                scan_workers = int(self.scan_workers_var.get())
-            except ValueError:
-                scan_workers = 12
-            scan_workers = max(1, min(scan_workers, 16))
-
+            scan_filter = StockFilter()
+            scan_filter.apply_settings(request.filter_settings)
+            scan_filter.set_log_callback(self._log_async)
             self._log_async(
-                f"扫描参数：数量={'全量' if max_stocks <= 0 else max_stocks}，并发线程={scan_workers}"
+                f"扫描参数：数量={'全量' if request.max_stocks <= 0 else request.max_stocks}，并发线程={request.scan_workers}"
             )
 
             def progress_callback(current, total, code, name):
@@ -892,22 +982,28 @@ class StockMonitorApp:
                 self.root.after(0, lambda: self.progress_var.set(progress))
                 self.root.after(0, lambda: self.status_var.set(f"扫描中 {current}/{total}: {code} {name}"))
 
-            results = self.stock_filter.scan_all_stocks(
-                max_stocks=max_stocks,
+            results = scan_filter.scan_all_stocks(
+                max_stocks=request.max_stocks,
                 progress_callback=progress_callback,
-                max_workers=scan_workers,
+                max_workers=request.scan_workers,
                 should_stop=lambda: not self.is_scanning,
-                refresh_universe=self.refresh_universe_var.get(),
-                allowed_boards=self._selected_boards(),
+                refresh_universe=request.refresh_universe,
+                allowed_boards=list(request.allowed_boards),
             )
+            if not self.is_scanning:
+                self.root.after(0, lambda: self._log("扫描已停止。"))
+                self.root.after(0, lambda: self.scan_finished("扫描已停止"))
+                return
             self.all_scan_results = results
-            self.root.after(0, lambda: self.update_result_table(results))
+            self.root.after(0, lambda res=results, req=request: self.update_result_table(res, request=req))
+            self.root.after(0, lambda count=len(results): self.scan_finished(f"扫描完成，命中 {count} 只。"))
         except StopIteration:
             self.root.after(0, lambda: self._log("扫描已停止。"))
+            self.root.after(0, lambda: self.scan_finished("扫描已停止"))
         except Exception as e:
-            self.root.after(0, lambda: self._log(f"扫描出错: {e}"))
-        finally:
-            self.root.after(0, self.scan_finished)
+            error_text = str(e)
+            self.root.after(0, lambda: self._log(f"扫描出错: {error_text}"))
+            self.root.after(0, lambda: self.scan_finished(f"扫描失败: {error_text}"))
 
     def _sort_value_for_column(self, item: Dict[str, Any], column: str):
         data = item.get("data", {}) or {}
@@ -1002,6 +1098,7 @@ class StockMonitorApp:
         results: List[Dict[str, Any]],
         announce: bool = True,
         persist: bool = True,
+        request: Optional[ScanRequest] = None,
     ):
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
@@ -1016,15 +1113,17 @@ class StockMonitorApp:
 
         self.filtered_stocks = results
         if persist:
-            self._save_last_results(results, complete=True)
+            self._save_last_results(results, complete=True, request=request)
         if announce:
             self._log(f"扫描完成，命中 {len(results)} 只。")
 
-    def scan_finished(self):
+    def scan_finished(self, status_text: str = "扫描完成"):
         self.scan_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-        self.status_var.set("扫描完成")
+        self.status_var.set(status_text)
         self.is_scanning = False
+        self._scan_thread = None
+        self._active_scan_request = None
         self.refresh_universe_var.set(False)
         self._close_run_log()
 
@@ -1054,6 +1153,8 @@ class StockMonitorApp:
         stock_code = self.stock_code_var.get().strip()
         if not stock_code:
             messagebox.showwarning("警告", "请输入股票代码")
+            return
+        if not self.update_filter_params():
             return
         self._cancel_scheduled_detail()
         self.show_stock_detail(stock_code, force_refresh=True)

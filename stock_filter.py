@@ -10,6 +10,7 @@ import weakref
 
 import pandas as pd
 
+from scan_models import FilterSettings
 from stock_data import StockDataFetcher
 from concurrent.futures.thread import _worker, _threads_queues
 
@@ -45,17 +46,31 @@ class StockFilter:
     def __init__(self):
         self.fetcher = StockDataFetcher()
         self._log: Optional[Callable[[str], None]] = None
-        self.trend_days = 5
-        self.ma_period = 5
-        self.limit_up_lookback_days = 5
-        self.volume_lookback_days = 5
-        self.volume_expand_enabled = True
-        self.volume_expand_factor = 2.0
-        self.require_limit_up_within_days = False
+        self.apply_settings(FilterSettings())
 
     def set_log_callback(self, cb: Optional[Callable[[str], None]]) -> None:
         self._log = cb
         self.fetcher.set_log_callback(cb)
+
+    def get_settings(self) -> FilterSettings:
+        return FilterSettings(
+            trend_days=int(self.trend_days),
+            ma_period=int(self.ma_period),
+            limit_up_lookback_days=int(self.limit_up_lookback_days),
+            volume_lookback_days=int(self.volume_lookback_days),
+            volume_expand_enabled=bool(self.volume_expand_enabled),
+            volume_expand_factor=float(self.volume_expand_factor),
+            require_limit_up_within_days=bool(self.require_limit_up_within_days),
+        )
+
+    def apply_settings(self, settings: FilterSettings) -> None:
+        self.trend_days = max(1, int(settings.trend_days))
+        self.ma_period = max(1, int(settings.ma_period))
+        self.limit_up_lookback_days = max(1, int(settings.limit_up_lookback_days))
+        self.volume_lookback_days = max(1, int(settings.volume_lookback_days))
+        self.volume_expand_enabled = bool(settings.volume_expand_enabled)
+        self.volume_expand_factor = max(1.0, float(settings.volume_expand_factor))
+        self.require_limit_up_within_days = bool(settings.require_limit_up_within_days)
 
     def _call_with_timeout(
         self,
