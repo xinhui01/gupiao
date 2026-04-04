@@ -10,7 +10,7 @@ import weakref
 
 import pandas as pd
 
-from scan_models import FilterSettings
+from scan_models import FilterSettings, HistoryRequestPlan
 from stock_data import StockDataFetcher
 from concurrent.futures.thread import _worker, _threads_queues
 
@@ -51,6 +51,18 @@ class StockFilter:
     def set_log_callback(self, cb: Optional[Callable[[str], None]]) -> None:
         self._log = cb
         self.fetcher.set_log_callback(cb)
+
+    def set_history_source_preference(self, source: str) -> None:
+        self.fetcher.set_default_history_source(source)
+
+    def set_intraday_source_preference(self, source: str) -> None:
+        self.fetcher.set_default_intraday_source(source)
+
+    def set_fund_flow_source_preference(self, source: str) -> None:
+        self.fetcher.set_default_fund_flow_source(source)
+
+    def set_limit_up_reason_source_preference(self, source: str) -> None:
+        self.fetcher.set_default_limit_up_reason_source(source)
 
     def _log_runtime_diagnostics(self, stage: str) -> None:
         if not self._log:
@@ -327,6 +339,7 @@ class StockFilter:
         exchange: str = "",
         history_mirror: Optional[str] = None,
         mirror_pool: Optional[List[str]] = None,
+        history_plan: Optional[HistoryRequestPlan] = None,
     ) -> Dict[str, Any]:
         result = {
             "code": str(stock_code).strip().zfill(6),
@@ -351,6 +364,7 @@ class StockFilter:
             days=hist_days,
             preferred_mirror=history_mirror,
             mirror_pool=mirror_pool,
+            request_plan=history_plan,
         )
         result["data"]["history"] = history_data
         if history_data is None or history_data.empty:
@@ -408,6 +422,8 @@ class StockFilter:
         max_stocks: int = 0,
         progress_callback=None,
         max_workers: Optional[int] = None,
+        history_source: str = "auto",
+        local_history_only: bool = True,
         should_stop: Optional[Callable[[], bool]] = None,
         refresh_universe: bool = False,
         allowed_boards: Optional[List[str]] = None,
@@ -459,13 +475,37 @@ class StockFilter:
         history_workers = max(1, int(self.fetcher.history_request_concurrency_limit()))
         workers = min(requested_workers, history_workers)
 
-        available_mirrors = self.fetcher.get_available_history_mirrors(force_refresh=False)
-        if not available_mirrors and log:
-            failures = self.fetcher.get_last_history_probe_failures()
-            if failures:
-                sample = "；".join(f"{host}: {detail}" for host, detail in list(failures.items())[:3])
-                log(f"历史接口镜像当前不可用，最近探测失败示例：{sample}")
-            log("历史接口暂不可用，本轮改为缓存优先扫描；未命中本地缓存的股票会被跳过。")
+        coverage = self.fetcher.get_history_cache_summary()
+        if log:
+            log(
+                f"历史缓存覆盖率：{coverage.get('covered_count', 0)}/{coverage.get('universe_count', 0)} "
+                f"({coverage.get('coverage_ratio', 0.0) * 100:.1f}%)，最新交易日 {coverage.get('latest_trade_date') or '-'}"
+            )
+
+        if local_history_only:
+            history_plan = HistoryRequestPlan(
+                mode="cache_only",
+                provider_sequence=("local-cache",),
+                mirror_urls=(),
+                reason="scan-local-cache-only",
+            )
+        else:
+            history_plan = self.fetcher.build_history_request_plan(
+                source=history_source,
+                force_refresh=False,
+            )
+        available_mirrors = list(history_plan.mirror_urls)
+        if log:
+            log(f"历史数据源策略：{'/'.join(history_plan.provider_sequence)}")
+        if history_plan.cache_only and log:
+            if history_plan.reason and history_plan.reason != "scan-local-cache-only":
+                log(f"历史接口镜像当前不可用，最近探测失败示例：{history_plan.reason}")
+            if history_plan.reason == "scan-local-cache-only":
+                log("本轮扫描使用本地历史缓存，不发起公网历史请求；未命中缓存的股票会被跳过。")
+            else:
+                log("历史接口暂不可用，本轮改为缓存优先扫描；未命中本地缓存的股票会被跳过。")
+        elif not available_mirrors and history_plan.provider_sequence and history_plan.provider_sequence[0] != "eastmoney" and log:
+            log("当前扫描已切换到非东方财富历史源。")
 
         rows = subset.to_dict("records")
         random.Random(int(time.time())).shuffle(rows)
@@ -486,7 +526,10 @@ class StockFilter:
                     f"并发保护已生效：你请求 {requested_workers} 线程，但历史接口当前只允许 {workers} 个并发，以降低东方财富限流风险。"
                 )
             log("说明：扫描阶段只拉历史日线，不拉实时、资金流或内外盘。")
-            log("说明：历史请求已启用全局节流、镜像冷却与封禁态熔断，避免失败后继续猛打东方财富。")
+            if local_history_only:
+                log("说明：扫描阶段默认只读本地缓存；首次或缓存不足时请先执行“更新历史缓存”。")
+            else:
+                log("说明：历史请求优先使用所选数据源；若为自动模式，会在东财失败后切换到腾讯/新浪。")
             if available_mirrors:
                 mirror_summary = "，".join(
                     f"{mirror.split('//', 1)[-1].split('/', 1)[0]}={mirror_counts.get(mirror, 0)}"
@@ -516,6 +559,7 @@ class StockFilter:
                     exchange,
                     mirror,
                     available_mirrors,
+                    history_plan,
                 )
                 future_to_meta[future] = (code, name, board, exchange, mirror)
             return future_to_meta

@@ -3,6 +3,7 @@ import time
 import re
 import warnings
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, TypeVar, Tuple
 from datetime import datetime, timedelta
@@ -14,6 +15,7 @@ from stock_store import (
     clear_history as clear_history_store,
     clear_scan_snapshots,
     clear_universe as clear_universe_store,
+    history_coverage_summary as load_history_coverage_summary,
     load_fund_flow as load_fund_flow_store,
     load_history as load_history_store,
     load_universe as load_universe_store,
@@ -21,10 +23,9 @@ from stock_store import (
     save_history as save_history_store,
     save_universe as save_universe_store,
 )
+from data_source_models import DATA_SOURCE_OPTIONS, DataProviderPlan, HistoryRequestPlan
 
 T = TypeVar("T")
-
-
 def _history_request_concurrency() -> int:
     raw = os.environ.get("GUPPIAO_HISTORY_CONCURRENCY", "").strip()
     try:
@@ -139,6 +140,7 @@ _HISTORY_DIAGNOSTICS: Dict[str, int] = {
     "probe_requests": 0,
     "probe_success": 0,
     "probe_failures": 0,
+    "probe_cache_hits": 0,
 }
 _EASTMONEY_HISTORY_MIRRORS = [
     "https://push2his.eastmoney.com/api/qt/stock/kline/get",
@@ -509,6 +511,88 @@ def _parse_eastmoney_hist_json(stock_code: str, data_json: Dict[str, Any]) -> "p
             "换手率",
         ]
     ]
+
+
+def _normalize_history_frame(df: "pd.DataFrame") -> "pd.DataFrame":
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    rename_map = {
+        "日期": "date",
+        "时间": "date",
+        "开盘": "open",
+        "收盘": "close",
+        "最高": "high",
+        "最低": "low",
+        "成交量": "volume",
+        "成交额": "amount",
+        "振幅": "amplitude",
+        "涨跌幅": "change_pct",
+        "涨跌额": "change_amount",
+        "换手率": "turnover_rate",
+    }
+    out = out.rename(columns=rename_map)
+    if "date" not in out.columns:
+        return pd.DataFrame()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date.astype(str)
+    for col in ("open", "close", "high", "low", "volume", "amount", "amplitude", "change_pct", "change_amount", "turnover_rate"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    if "close" not in out.columns:
+        return pd.DataFrame()
+    close_series = pd.to_numeric(out["close"], errors="coerce")
+    prev_close = close_series.shift(1)
+    if "change_amount" not in out.columns:
+        out["change_amount"] = close_series - prev_close
+    if "change_pct" not in out.columns:
+        out["change_pct"] = ((close_series / prev_close) - 1.0) * 100.0
+    if "volume" not in out.columns and "amount" in out.columns:
+        out["volume"] = pd.to_numeric(out["amount"], errors="coerce")
+    if "amount" not in out.columns:
+        out["amount"] = pd.Series([None] * len(out), dtype="float64")
+    if "amplitude" not in out.columns and {"high", "low", "close"} <= set(out.columns):
+        base_close = prev_close.where(prev_close.notna() & (prev_close != 0), close_series)
+        out["amplitude"] = ((pd.to_numeric(out["high"], errors="coerce") - pd.to_numeric(out["low"], errors="coerce")) / base_close) * 100.0
+    if "turnover_rate" not in out.columns:
+        out["turnover_rate"] = pd.Series([None] * len(out), dtype="float64")
+    keep_cols = [
+        "date",
+        "open",
+        "close",
+        "high",
+        "low",
+        "volume",
+        "amount",
+        "amplitude",
+        "change_pct",
+        "change_amount",
+        "turnover_rate",
+    ]
+    return out[keep_cols].dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+
+
+def _fetch_tencent_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
+    symbol = _market_prefixed_code(stock_code)
+    df = _retry_ak_call(
+        ak.stock_zh_a_hist_tx,
+        symbol=symbol,
+        start_date=start_date,
+        end_date=end_date,
+        adjust="",
+    )
+    return _normalize_history_frame(df)
+
+
+def _fetch_sina_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
+    symbol = _market_prefixed_code(stock_code)
+    df = _retry_ak_call(
+        ak.stock_zh_a_daily,
+        symbol=symbol,
+        start_date=start_date,
+        end_date=end_date,
+        adjust="",
+    )
+    return _normalize_history_frame(df)
 
 
 def _probe_history_mirror(url: str) -> Tuple[bool, str]:
@@ -1006,6 +1090,11 @@ def _infer_market(code: str) -> str:
     return "sh" if c.startswith(("5", "6", "9")) else "sz"
 
 
+def _market_prefixed_code(code: str) -> str:
+    norm = str(code or "").strip().zfill(6)
+    return f"{_infer_market(norm)}{norm}"
+
+
 def _normalize_concepts_text(value: Any) -> str:
     text = str(value or "").strip()
     if not text or text.lower() == "nan":
@@ -1122,12 +1211,200 @@ class StockDataFetcher:
         self._concepts_lock = threading.Lock()
         self._last_history_probe_failures: Dict[str, str] = {}
         self._last_history_block_log_at: float = 0.0
+        self._default_history_source: str = "auto"
+        self._default_intraday_source: str = "auto"
+        self._default_fund_flow_source: str = "auto"
+        self._default_limit_up_reason_source: str = "auto"
 
     def set_log_callback(self, cb: Optional[Callable[[str], None]]) -> None:
         self._log = cb
 
     def history_request_concurrency_limit(self) -> int:
         return _history_request_concurrency()
+
+    def get_history_cache_summary(self) -> Dict[str, Any]:
+        payload = load_history_coverage_summary()
+        payload["history_source"] = self._default_history_source
+        return payload
+
+    def _normalize_source(self, domain: str, source: str) -> str:
+        options = DATA_SOURCE_OPTIONS.get(domain, ("auto",))
+        value = str(source or "auto").strip().lower()
+        return value if value in options else "auto"
+
+    def normalize_history_source(self, source: str) -> str:
+        return self._normalize_source("history", source)
+
+    def normalize_intraday_source(self, source: str) -> str:
+        return self._normalize_source("intraday", source)
+
+    def normalize_fund_flow_source(self, source: str) -> str:
+        return self._normalize_source("fund_flow", source)
+
+    def normalize_limit_up_reason_source(self, source: str) -> str:
+        return self._normalize_source("limit_up_reason", source)
+
+    def set_default_history_source(self, source: str) -> None:
+        self._default_history_source = self.normalize_history_source(source)
+
+    def set_default_intraday_source(self, source: str) -> None:
+        self._default_intraday_source = self.normalize_intraday_source(source)
+
+    def set_default_fund_flow_source(self, source: str) -> None:
+        self._default_fund_flow_source = self.normalize_fund_flow_source(source)
+
+    def set_default_limit_up_reason_source(self, source: str) -> None:
+        self._default_limit_up_reason_source = self.normalize_limit_up_reason_source(source)
+
+    def update_history_cache(
+        self,
+        max_stocks: int = 0,
+        days: int = 60,
+        source: Optional[str] = None,
+        workers: Optional[int] = None,
+        progress_callback: Optional[Callable[[int, int, str, str], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+        refresh_universe: bool = False,
+        allowed_boards: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        universe = self.get_all_stocks(force_refresh=refresh_universe)
+        if universe is None or universe.empty:
+            return {"total": 0, "updated": 0, "failed": 0, "skipped": 0}
+        if allowed_boards and "board" in universe.columns:
+            allowed = {str(x).strip() for x in allowed_boards if str(x).strip()}
+            if allowed:
+                universe = universe[universe["board"].astype(str).isin(allowed)].reset_index(drop=True)
+        if max_stocks and max_stocks > 0:
+            universe = universe.head(max_stocks).reset_index(drop=True)
+        rows = universe.to_dict("records")
+        total = len(rows)
+        if total <= 0:
+            return {"total": 0, "updated": 0, "failed": 0, "skipped": 0}
+
+        plan = self.build_history_request_plan(source=source or self._default_history_source, force_refresh=False)
+        worker_count = max(
+            1,
+            min(int(workers or self.history_request_concurrency_limit()), self.history_request_concurrency_limit()),
+        )
+        updated = 0
+        failed = 0
+        skipped = 0
+
+        def _work(item: Dict[str, Any]) -> tuple[str, str, bool]:
+            code = str(item.get("code", "")).strip().zfill(6)
+            name = str(item.get("name", "") or "")
+            if should_stop and should_stop():
+                return code, name, False
+            df = self.get_history_data(
+                code,
+                days=days,
+                force_refresh=True,
+                request_plan=plan,
+            )
+            return code, name, bool(df is not None and not df.empty)
+
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="hist-cache") as executor:
+            futures = [executor.submit(_work, item) for item in rows]
+            completed = 0
+            for fut in as_completed(futures):
+                completed += 1
+                code, name, ok = fut.result()
+                if should_stop and should_stop():
+                    skipped = max(0, total - completed)
+                    break
+                if ok:
+                    updated += 1
+                else:
+                    failed += 1
+                if progress_callback:
+                    progress_callback(completed, total, code, name)
+
+        return {
+            "total": total,
+            "updated": updated,
+            "failed": failed,
+            "skipped": skipped,
+            "plan": "/".join(plan.provider_sequence),
+        }
+
+    def build_intraday_request_plan(self, source: str = "auto") -> DataProviderPlan:
+        normalized = self.normalize_intraday_source(source)
+        if normalized == "eastmoney":
+            return DataProviderPlan(mode="network", provider_sequence=("eastmoney",), reason="intraday-provider=eastmoney")
+        if normalized == "legacy":
+            return DataProviderPlan(mode="network", provider_sequence=("legacy",), reason="intraday-provider=legacy")
+        return DataProviderPlan(mode="network", provider_sequence=("eastmoney", "legacy"), reason="intraday-provider=auto")
+
+    def build_fund_flow_request_plan(self, source: str = "auto") -> DataProviderPlan:
+        normalized = self.normalize_fund_flow_source(source)
+        if normalized == "eastmoney":
+            return DataProviderPlan(mode="network", provider_sequence=("eastmoney",), reason="fund-flow-provider=eastmoney")
+        return DataProviderPlan(mode="network", provider_sequence=("eastmoney",), reason="fund-flow-provider=auto")
+
+    def build_limit_up_reason_plan(self, source: str = "auto") -> DataProviderPlan:
+        normalized = self.normalize_limit_up_reason_source(source)
+        if normalized == "eastmoney":
+            return DataProviderPlan(mode="network", provider_sequence=("eastmoney",), reason="limit-up-provider=eastmoney")
+        return DataProviderPlan(mode="network", provider_sequence=("eastmoney",), reason="limit-up-provider=auto")
+
+    def build_history_request_plan(self, source: str = "auto", force_refresh: bool = False) -> HistoryRequestPlan:
+        normalized = self.normalize_history_source(source)
+        if normalized == "tencent":
+            return HistoryRequestPlan(
+                mode="network",
+                provider_sequence=("tencent",),
+                mirror_urls=(),
+                reason="history-provider=tencent",
+            )
+        if normalized == "sina":
+            return HistoryRequestPlan(
+                mode="network",
+                provider_sequence=("sina",),
+                mirror_urls=(),
+                reason="history-provider=sina",
+            )
+
+        mirrors = tuple(self.get_available_history_mirrors(force_refresh=force_refresh))
+        if normalized == "eastmoney":
+            if mirrors:
+                return HistoryRequestPlan(
+                    mode="network",
+                    provider_sequence=("eastmoney",),
+                    mirror_urls=mirrors,
+                    reason="history-provider=eastmoney",
+                )
+            failures = self.get_last_history_probe_failures()
+            reason = ""
+            if failures:
+                reason = "；".join(f"{host}: {detail}" for host, detail in list(failures.items())[:3])
+            if not reason:
+                reason = "history-mirrors-unavailable"
+            return HistoryRequestPlan(
+                mode="cache_only",
+                provider_sequence=("eastmoney",),
+                mirror_urls=(),
+                reason=reason,
+            )
+
+        if mirrors:
+            return HistoryRequestPlan(
+                mode="network",
+                provider_sequence=("eastmoney", "tencent", "sina"),
+                mirror_urls=mirrors,
+                reason="history-provider=auto",
+            )
+        failures = self.get_last_history_probe_failures()
+        reason = ""
+        if failures:
+            reason = "；".join(f"{host}: {detail}" for host, detail in list(failures.items())[:3])
+        if not reason:
+            reason = "history-mirrors-unavailable"
+        return HistoryRequestPlan(
+            mode="network",
+            provider_sequence=("tencent", "sina"),
+            mirror_urls=(),
+            reason=reason,
+        )
 
     def get_runtime_diagnostics(self) -> Dict[str, Any]:
         blocked_until = _history_access_blocked_until()
@@ -1166,7 +1443,8 @@ class StockDataFetcher:
 
     def get_available_history_mirrors(self, force_refresh: bool = False) -> List[str]:
         now = time.time()
-        if not force_refresh and self._history_mirror_cache and now - self._history_mirror_checked_at < 180:
+        if not force_refresh and now - self._history_mirror_checked_at < 180:
+            _increment_history_diagnostic("probe_cache_hits")
             return list(self._history_mirror_cache)
         if self._log_history_access_suspended():
             return list(self._history_mirror_cache)
@@ -1325,27 +1603,39 @@ class StockDataFetcher:
     def _normalize_trade_date(self, trade_date: str) -> str:
         return re.sub(r"\D", "", str(trade_date or ""))[:8]
 
-    def _load_strong_pool(self, trade_date: str) -> pd.DataFrame:
+    def _load_strong_pool(self, trade_date: str, source: Optional[str] = None) -> pd.DataFrame:
         date_key = self._normalize_trade_date(trade_date)
         if not date_key:
             return pd.DataFrame()
-        cached = self._strong_pool_cache.get(date_key)
+        provider = self.normalize_limit_up_reason_source(source or self._default_limit_up_reason_source)
+        cache_key = f"{provider}:{date_key}"
+        cached = self._strong_pool_cache.get(cache_key)
         if cached is not None:
             return cached
-        try:
-            df = _retry_ak_call(ak.stock_zt_pool_strong_em, date=date_key)
-        except Exception as e:
-            if self._log:
-                self._log(f"强势股池 {date_key} 获取失败: {e}")
+        plan = self.build_limit_up_reason_plan(provider)
+        df = pd.DataFrame()
+        last_error: Optional[Exception] = None
+        for provider_name in plan.provider_sequence:
+            if provider_name == "eastmoney":
+                try:
+                    df = _retry_ak_call(ak.stock_zt_pool_strong_em, date=date_key)
+                    break
+                except Exception as e:
+                    last_error = e
+                    if self._log:
+                        self._log(f"强势股池 {date_key} 获取失败: {e}")
+        if df is None or getattr(df, "empty", True):
             df = pd.DataFrame()
-        self._strong_pool_cache[date_key] = df
+            if last_error is not None and self._log:
+                self._log(f"涨停原因数据源全部失败 {date_key}: {last_error}")
+        self._strong_pool_cache[cache_key] = df
         return df
 
-    def get_limit_up_reason(self, stock_code: str, trade_date: str) -> str:
+    def get_limit_up_reason(self, stock_code: str, trade_date: str, source: Optional[str] = None) -> str:
         code = str(stock_code or "").strip().zfill(6)
         if not code:
             return ""
-        pool = self._load_strong_pool(trade_date)
+        pool = self._load_strong_pool(trade_date, source=source)
         if pool is None or pool.empty:
             return ""
         if "代码" not in pool.columns or "入选理由" not in pool.columns:
@@ -1379,6 +1669,7 @@ class StockDataFetcher:
         stock_code: str,
         days: int = 30,
         force_refresh: bool = False,
+        source: Optional[str] = None,
     ) -> Optional[pd.DataFrame]:
         code = str(stock_code or "").strip().zfill(6)
         if not code:
@@ -1399,13 +1690,23 @@ class StockDataFetcher:
                 elif self._log:
                     self._log(f"资金流 {code} 命中当天缓存，但尚未收盘，改为刷新最新数据。")
         market = _infer_market(code)
-        try:
-            flow_df = _retry_ak_call(ak.stock_individual_fund_flow, stock=code, market=market)
-        except Exception as e:
-            if self._log:
-                self._log(f"个股资金流 {code} 获取失败: {e}")
+        plan = self.build_fund_flow_request_plan(source or self._default_fund_flow_source)
+        flow_df = None
+        last_error: Optional[Exception] = None
+        for provider in plan.provider_sequence:
+            if provider == "eastmoney":
+                try:
+                    flow_df = _retry_ak_call(ak.stock_individual_fund_flow, stock=code, market=market)
+                    break
+                except Exception as e:
+                    last_error = e
+                    if self._log:
+                        self._log(f"个股资金流 {code} 获取失败: {e}")
+        if flow_df is None:
             return None
         if flow_df is None or flow_df.empty:
+            if last_error is not None and self._log:
+                self._log(f"个股资金流 {code} 所有数据源失败: {last_error}")
             return None
         source_columns = [str(col) for col in flow_df.columns.tolist()]
         rename_map: Dict[str, str] = {}
@@ -1554,12 +1855,15 @@ class StockDataFetcher:
         force_refresh: bool = False,
         preferred_mirror: Optional[str] = None,
         mirror_pool: Optional[List[str]] = None,
+        request_plan: Optional[HistoryRequestPlan] = None,
     ) -> Optional[pd.DataFrame]:
         history_df: Optional[pd.DataFrame] = None
         try:
             stock_code = str(stock_code).strip().zfill(6)
             end_date = datetime.now().strftime('%Y%m%d')
             min_rows = max(1, days)
+            if request_plan is None:
+                request_plan = self.build_history_request_plan(source=self._default_history_source, force_refresh=False)
 
             if not force_refresh:
                 history_df = _load_history_store(stock_code, min_rows, end_date, self._log)
@@ -1570,75 +1874,108 @@ class StockDataFetcher:
                     if self._log:
                         self._log(f"历史 {stock_code} 命中当天缓存，但尚未收盘，改为刷新最新日线。")
 
-            if self._log_history_access_suspended():
+            eastmoney_only = bool(request_plan.provider_sequence) and all(
+                provider == "eastmoney" for provider in request_plan.provider_sequence
+            )
+            if eastmoney_only and self._log_history_access_suspended():
+                if history_df is not None and not history_df.empty:
+                    _increment_history_diagnostic("fallback_cache_returns")
+                    return history_df.tail(days).reset_index(drop=True)
+                return None
+
+            if request_plan is not None and request_plan.cache_only:
+                if self._log:
+                    self._log(f"历史 {stock_code} 使用扫描上下文 cache-only 策略，本次不访问东方财富。")
                 if history_df is not None and not history_df.empty:
                     _increment_history_diagnostic("fallback_cache_returns")
                     return history_df.tail(days).reset_index(drop=True)
                 return None
 
             start_date = (datetime.now() - timedelta(days=days + 15)).strftime('%Y%m%d')
-            selected_mirrors = [x for x in (mirror_pool or self.get_available_history_mirrors()) if x]
-            selected_mirrors = _prioritize_history_mirrors(
-                selected_mirrors,
-                preferred_mirror=preferred_mirror,
-            )
-            if not selected_mirrors:
-                if history_df is not None and not history_df.empty:
-                    if self._log:
-                        self._log(f"历史 {stock_code} 当前无可用镜像，回退本地缓存。")
-                    _increment_history_diagnostic("fallback_cache_returns")
-                    return history_df.tail(days).reset_index(drop=True)
-                return None
-            
-            df = _history_retry_ak_call(
-                _fetch_eastmoney_hist_frame,
-                stock_code,
-                days,
-                start_date,
-                end_date,
-                selected_mirrors,
-                self._log,
-            )
-            
-            if df.empty:
-                if history_df is not None and not history_df.empty:
-                    if self._log:
-                        self._log(f"历史 {stock_code} 刷新返回空结果，回退本地缓存。")
-                    _increment_history_diagnostic("fallback_cache_returns")
-                    return history_df.tail(days).reset_index(drop=True)
-                return None
-            
-            df = df.rename(columns={
-                '日期': 'date',
-                '开盘': 'open',
-                '收盘': 'close',
-                '最高': 'high',
-                '最低': 'low',
-                '成交量': 'volume',
-                '成交额': 'amount',
-                '振幅': 'amplitude',
-                '涨跌幅': 'change_pct',
-                '涨跌额': 'change_amount',
-                '换手率': 'turnover_rate'
-            })
-            for col in [
-                "open",
-                "close",
-                "high",
-                "low",
-                "volume",
-                "amount",
-                "amplitude",
-                "change_pct",
-                "change_amount",
-                "turnover_rate",
-            ]:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            provider_sequence = list(request_plan.provider_sequence) if request_plan is not None else ["eastmoney"]
+            if not provider_sequence:
+                provider_sequence = ["eastmoney"]
 
-            df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
-            _save_history_store(stock_code, df, keep_rows=max(40, days + 10))
-            return df.tail(days).reset_index(drop=True)
+            last_error: Optional[BaseException] = None
+            for provider in provider_sequence:
+                if provider == "eastmoney":
+                    if request_plan is not None:
+                        raw_mirror_pool = list(request_plan.mirror_urls)
+                    else:
+                        raw_mirror_pool = mirror_pool if mirror_pool is not None else self.get_available_history_mirrors()
+                    selected_mirrors = [x for x in raw_mirror_pool if x]
+                    selected_mirrors = _prioritize_history_mirrors(
+                        selected_mirrors,
+                        preferred_mirror=preferred_mirror,
+                    )
+                    if not selected_mirrors:
+                        last_error = RuntimeError("eastmoney-no-mirror")
+                        continue
+                    try:
+                        df = _history_retry_ak_call(
+                            _fetch_eastmoney_hist_frame,
+                            stock_code,
+                            days,
+                            start_date,
+                            end_date,
+                            selected_mirrors,
+                            self._log,
+                        )
+                    except Exception as e:
+                        last_error = e
+                        if self._log:
+                            self._log(f"历史 {stock_code} 使用东财源失败，准备切换备用源: {e}")
+                        continue
+                    df = _normalize_history_frame(df)
+                elif provider == "tencent":
+                    try:
+                        if self._log:
+                            self._log(f"历史 {stock_code} 正在使用腾讯源补位。")
+                        df = _history_retry_ak_call(
+                            _fetch_tencent_hist_frame,
+                            stock_code,
+                            start_date,
+                            end_date,
+                        )
+                    except Exception as e:
+                        last_error = e
+                        if self._log:
+                            self._log(f"历史 {stock_code} 使用腾讯源失败，准备切换下一个备用源: {e}")
+                        continue
+                elif provider == "sina":
+                    try:
+                        if self._log:
+                            self._log(f"历史 {stock_code} 正在使用新浪源补位。")
+                        df = _history_retry_ak_call(
+                            _fetch_sina_hist_frame,
+                            stock_code,
+                            start_date,
+                            end_date,
+                        )
+                    except Exception as e:
+                        last_error = e
+                        if self._log:
+                            self._log(f"历史 {stock_code} 使用新浪源失败: {e}")
+                        continue
+                else:
+                    last_error = RuntimeError(f"unsupported-history-provider: {provider}")
+                    continue
+
+                if df is None or df.empty:
+                    last_error = RuntimeError(f"{provider}-empty-history")
+                    continue
+
+                _save_history_store(stock_code, df, keep_rows=max(40, days + 10))
+                return df.tail(days).reset_index(drop=True)
+
+            if history_df is not None and not history_df.empty:
+                if self._log:
+                    self._log(f"历史 {stock_code} 全部数据源失败，回退本地缓存: {last_error}")
+                _increment_history_diagnostic("fallback_cache_returns")
+                return history_df.tail(days).reset_index(drop=True)
+            if last_error is not None:
+                raise last_error
+            return None
         except Exception as e:
             if not isinstance(e, (EastmoneyRateLimitError, HistoryAccessSuspendedError)):
                 _increment_history_diagnostic("network_failures")
@@ -1652,28 +1989,31 @@ class StockDataFetcher:
             print(f"获取股票 {stock_code} 历史数据失败: {e}")
             return None
 
-    def get_intraday_data(self, stock_code: str) -> Optional[pd.DataFrame]:
+    def get_intraday_data(self, stock_code: str, source: Optional[str] = None) -> Optional[pd.DataFrame]:
         code = str(stock_code or "").strip().zfill(6)
         if not code:
             return None
 
         raw = None
         last_error: Optional[Exception] = None
-
-        try:
-            raw = _retry_ak_call(ak.stock_zh_a_hist_min_em, symbol=code, period="1", adjust="")
-        except Exception as e:
-            last_error = e
-            if self._log:
-                self._log(f"分时行情(主接口) {code} 获取失败: {e}")
-
-        if raw is None or getattr(raw, "empty", True):
-            try:
-                raw = _retry_ak_call(ak.stock_zh_a_minute, symbol=code, period="1")
-            except Exception as e:
-                last_error = e
-                if self._log:
-                    self._log(f"分时行情(备用接口) {code} 获取失败: {e}")
+        plan = self.build_intraday_request_plan(source or self._default_intraday_source)
+        for provider in plan.provider_sequence:
+            if provider == "eastmoney":
+                try:
+                    raw = _retry_ak_call(ak.stock_zh_a_hist_min_em, symbol=code, period="1", adjust="")
+                except Exception as e:
+                    last_error = e
+                    if self._log:
+                        self._log(f"分时行情(东财) {code} 获取失败: {e}")
+            elif provider == "legacy":
+                try:
+                    raw = _retry_ak_call(ak.stock_zh_a_minute, symbol=code, period="1")
+                except Exception as e:
+                    last_error = e
+                    if self._log:
+                        self._log(f"分时行情(备用源) {code} 获取失败: {e}")
+            if raw is not None and not getattr(raw, "empty", True):
+                break
 
         if raw is None or getattr(raw, "empty", True):
             if self._log and last_error is not None:

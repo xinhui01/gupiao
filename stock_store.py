@@ -291,6 +291,36 @@ def load_history(stock_code: str, limit: Optional[int] = None) -> Optional[pd.Da
     return df.reset_index(drop=True)
 
 
+def history_coverage_summary() -> Dict[str, Any]:
+    if not _DB_PATH.is_file():
+        return {
+            "universe_count": 0,
+            "covered_count": 0,
+            "coverage_ratio": 0.0,
+            "latest_trade_date": "",
+            "latest_updated_at": "",
+        }
+
+    def _read():
+        with _connect() as conn:
+            universe_count = conn.execute("SELECT COUNT(*) FROM universe").fetchone()[0]
+            covered_count = conn.execute("SELECT COUNT(DISTINCT code) FROM history").fetchone()[0]
+            latest_trade_date = conn.execute("SELECT MAX(trade_date) FROM history").fetchone()[0] or ""
+            latest_updated_at = conn.execute("SELECT MAX(updated_at) FROM history").fetchone()[0] or ""
+            return {
+                "universe_count": int(universe_count or 0),
+                "covered_count": int(covered_count or 0),
+                "latest_trade_date": str(latest_trade_date or ""),
+                "latest_updated_at": str(latest_updated_at or ""),
+            }
+
+    payload = _retry_locked(_read)
+    universe_count = int(payload.get("universe_count", 0) or 0)
+    covered_count = int(payload.get("covered_count", 0) or 0)
+    payload["coverage_ratio"] = (covered_count / universe_count) if universe_count > 0 else 0.0
+    return payload
+
+
 def save_fund_flow(stock_code: str, df: pd.DataFrame) -> None:
     if df is None or df.empty or "date" not in df.columns:
         return

@@ -20,6 +20,7 @@ from matplotlib.ticker import FuncFormatter
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 
 from scan_models import FilterSettings, ScanRequest
+from data_source_models import DATA_SOURCE_OPTIONS
 from stock_filter import StockFilter
 from stock_data import clear_history_data, clear_universe_data
 from stock_store import ensure_store_ready, load_latest_scan_snapshot, load_scan_snapshot, save_scan_snapshot
@@ -50,7 +51,9 @@ class StockMonitorApp:
         self.sort_column = "five_day_return"
         self.sort_reverse = True
         self.is_scanning = False
+        self.is_updating_cache = False
         self._scan_thread: Optional[threading.Thread] = None
+        self._cache_thread: Optional[threading.Thread] = None
         self._active_scan_request: Optional[ScanRequest] = None
         self._run_log_file: Optional[Path] = None
         self._current_scan_allowed_boards: List[str] = []
@@ -61,11 +64,16 @@ class StockMonitorApp:
         self.result_column_order: List[str] = []
         self.default_result_display_columns: tuple[str, ...] = ()
         self.result_layout_path = Path("data") / "result_columns.json"
+        self.board_filter_layout_path = Path("data") / "board_filters.json"
+        self.app_settings_path = Path("data") / "app_settings.json"
         self._log_queue: "queue.SimpleQueue[str]" = queue.SimpleQueue()
         self._main_thread_id = threading.get_ident()
 
         self.setup_ui()
+        self._load_app_settings()
+        self._apply_source_preferences()
         self._load_result_column_layout()
+        self._load_board_filter_layout()
         self.apply_result_display_columns(save=False)
         self._load_last_results()
         self.root.after(100, self._drain_log_queue)
@@ -183,6 +191,9 @@ class StockMonitorApp:
         self.scan_btn = ttk.Button(row2, text="开始扫描", command=self.start_scan)
         self.scan_btn.pack(side=tk.LEFT, padx=5)
 
+        self.update_cache_btn = ttk.Button(row2, text="更新历史缓存", command=self.start_history_cache_update)
+        self.update_cache_btn.pack(side=tk.LEFT, padx=5)
+
         self.stop_btn = ttk.Button(row2, text="停止", command=self.stop_scan, state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
 
@@ -190,7 +201,22 @@ class StockMonitorApp:
         self.stock_code_var = tk.StringVar()
         ttk.Entry(row2, textvariable=self.stock_code_var, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(row2, text="查询股票", command=self.query_single_stock).pack(side=tk.LEFT, padx=15)
+        ttk.Label(row2, text="历史源:").pack(side=tk.LEFT, padx=(8, 4))
+        self.history_source_var = tk.StringVar(value="auto")
+        self.history_source_combo = ttk.Combobox(
+            row2,
+            textvariable=self.history_source_var,
+            width=12,
+            state="readonly",
+            values=DATA_SOURCE_OPTIONS["history"],
+        )
+        self.history_source_combo.pack(side=tk.LEFT, padx=4)
+        self.history_source_combo.bind("<<ComboboxSelected>>", self.on_history_source_changed)
         ttk.Button(row2, text="列表列设置", command=self.show_column_picker).pack(side=tk.LEFT, padx=8)
+
+        self.intraday_source_var = tk.StringVar(value="auto")
+        self.fund_flow_source_var = tk.StringVar(value="auto")
+        self.limit_up_reason_source_var = tk.StringVar(value="auto")
 
         row3 = ttk.Frame(control_frame)
         row3.pack(fill=tk.X, pady=5)
@@ -336,6 +362,76 @@ class StockMonitorApp:
         if visible:
             return visible
         return ("code", "name", "latest_close")
+
+    def _save_board_filter_layout(self) -> None:
+        self.board_filter_layout_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "selected": [
+                board
+                for board, var in self.board_filter_vars.items()
+                if var.get()
+            ],
+        }
+        self.board_filter_layout_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _load_board_filter_layout(self) -> None:
+        if not self.board_filter_layout_path.exists() or not self.board_filter_vars:
+            return
+        try:
+            payload = json.loads(self.board_filter_layout_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        saved_selected = {
+            str(board).strip()
+            for board in (payload.get("selected") or [])
+            if str(board).strip() in self.board_filter_vars
+        }
+        if not saved_selected:
+            return
+        for board, var in self.board_filter_vars.items():
+            var.set(board in saved_selected)
+
+    def _save_app_settings(self) -> None:
+        self.app_settings_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "history_source": str(self.history_source_var.get() or "auto").strip().lower() or "auto",
+            "intraday_source": str(self.intraday_source_var.get() or "auto").strip().lower() or "auto",
+            "fund_flow_source": str(self.fund_flow_source_var.get() or "auto").strip().lower() or "auto",
+            "limit_up_reason_source": str(self.limit_up_reason_source_var.get() or "auto").strip().lower() or "auto",
+        }
+        self.app_settings_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _load_app_settings(self) -> None:
+        if not self.app_settings_path.exists():
+            return
+        try:
+            payload = json.loads(self.app_settings_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        source = str(payload.get("history_source") or "auto").strip().lower() or "auto"
+        if source in DATA_SOURCE_OPTIONS["history"]:
+            self.history_source_var.set(source)
+        intraday_source = str(payload.get("intraday_source") or "auto").strip().lower() or "auto"
+        if intraday_source in DATA_SOURCE_OPTIONS["intraday"]:
+            self.intraday_source_var.set(intraday_source)
+        fund_flow_source = str(payload.get("fund_flow_source") or "auto").strip().lower() or "auto"
+        if fund_flow_source in DATA_SOURCE_OPTIONS["fund_flow"]:
+            self.fund_flow_source_var.set(fund_flow_source)
+        limit_up_reason_source = str(payload.get("limit_up_reason_source") or "auto").strip().lower() or "auto"
+        if limit_up_reason_source in DATA_SOURCE_OPTIONS["limit_up_reason"]:
+            self.limit_up_reason_source_var.set(limit_up_reason_source)
+
+    def _apply_source_preferences(self) -> None:
+        self.stock_filter.set_history_source_preference(self.history_source_var.get())
+        self.stock_filter.set_intraday_source_preference(self.intraday_source_var.get())
+        self.stock_filter.set_fund_flow_source_preference(self.fund_flow_source_var.get())
+        self.stock_filter.set_limit_up_reason_source_preference(self.limit_up_reason_source_var.get())
 
     def _save_result_column_layout(self) -> None:
         self.result_layout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -776,6 +872,7 @@ class StockMonitorApp:
             filter_settings=settings,
             max_stocks=max_stocks,
             scan_workers=scan_workers,
+            history_source=str(self.history_source_var.get() or "auto").strip().lower() or "auto",
             allowed_boards=tuple(self._selected_boards()),
             refresh_universe=bool(self.refresh_universe_var.get()),
             ignore_result_snapshot=bool(self.ignore_result_snapshot_var.get()),
@@ -842,14 +939,26 @@ class StockMonitorApp:
         return filtered
 
     def on_board_filter_changed(self):
+        self._save_board_filter_layout()
         if self.is_scanning:
             return
         source = self.all_scan_results or self.filtered_stocks
         if not source:
+            self.status_var.set("已保存显示板块筛选设置")
             return
         filtered = self._filter_results_by_selected_boards(source)
         self.update_result_table(filtered, announce=False, persist=False)
         self.status_var.set(f"已按板块筛选，当前显示 {len(filtered)} 只")
+
+    def on_history_source_changed(self, event=None):
+        self._save_app_settings()
+        source = str(self.history_source_var.get() or "auto").strip().lower() or "auto"
+        self._apply_source_preferences()
+        self.status_var.set(f"历史数据源已切换为 {source}")
+        self._log(
+            f"数据源设置已更新: history={self.history_source_var.get()}, intraday={self.intraday_source_var.get()}, fund_flow={self.fund_flow_source_var.get()}, limit_up_reason={self.limit_up_reason_source_var.get()}"
+        )
+        return None
 
     def _scan_signature(self, request: ScanRequest) -> Dict[str, Any]:
         return request.to_signature()
@@ -918,8 +1027,15 @@ class StockMonitorApp:
     def update_filter_params(self) -> bool:
         return self._apply_filter_settings_from_ui(show_error=True) is not None
 
+    def _history_cache_summary_text(self) -> str:
+        summary = self.stock_filter.fetcher.get_history_cache_summary()
+        return (
+            f"历史缓存 {summary.get('covered_count', 0)}/{summary.get('universe_count', 0)} "
+            f"({summary.get('coverage_ratio', 0.0) * 100:.1f}%)，最新交易日 {summary.get('latest_trade_date') or '-'}"
+        )
+
     def start_scan(self):
-        if self.is_scanning:
+        if self.is_scanning or self.is_updating_cache:
             return
         request = self._build_scan_request()
         if request is None:
@@ -954,6 +1070,8 @@ class StockMonitorApp:
             f"开始扫描：最近{request.filter_settings.trend_days}日收盘 > MA{request.filter_settings.ma_period}，"
             f"近{request.filter_settings.limit_up_lookback_days}日内涨停过滤={'开' if request.filter_settings.require_limit_up_within_days else '关'}。"
         )
+        self._log(self._history_cache_summary_text())
+        self._log(f"本轮历史数据源：{request.history_source}")
         if request.max_stocks <= 0:
             self._log("本次为全量扫描，建议优先在收盘后执行，并尽量复用本地结果快照。")
         if request.scan_workers >= 4:
@@ -971,8 +1089,27 @@ class StockMonitorApp:
         self._scan_thread = threading.Thread(target=self.scan_stocks, args=(request,), daemon=True)
         self._scan_thread.start()
 
+    def start_history_cache_update(self):
+        if self.is_scanning or self.is_updating_cache:
+            return
+        request = self._build_scan_request()
+        if request is None:
+            return
+        self.is_updating_cache = True
+        self.scan_btn.config(state=tk.DISABLED)
+        self.update_cache_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self._open_run_log()
+        self._log("开始更新历史缓存。")
+        self._log(self._history_cache_summary_text())
+        self.status_var.set("正在更新历史缓存...")
+        self.progress_var.set(0)
+        self._cache_thread = threading.Thread(target=self.update_history_cache, args=(request,), daemon=True)
+        self._cache_thread.start()
+
     def stop_scan(self):
         self.is_scanning = False
+        self.is_updating_cache = False
         self.status_var.set("正在停止...")
         self._log("已请求停止，正在等待当前任务结束。")
 
@@ -982,7 +1119,7 @@ class StockMonitorApp:
             scan_filter.apply_settings(request.filter_settings)
             scan_filter.set_log_callback(self._log_async)
             self._log_async(
-                f"扫描参数：数量={'全量' if request.max_stocks <= 0 else request.max_stocks}，并发线程={request.scan_workers}"
+                f"扫描参数：数量={'全量' if request.max_stocks <= 0 else request.max_stocks}，并发线程={request.scan_workers}，历史源={request.history_source}"
             )
 
             def progress_callback(current, total, code, name):
@@ -996,6 +1133,8 @@ class StockMonitorApp:
                 max_stocks=request.max_stocks,
                 progress_callback=progress_callback,
                 max_workers=request.scan_workers,
+                history_source=request.history_source,
+                local_history_only=True,
                 should_stop=lambda: not self.is_scanning,
                 refresh_universe=request.refresh_universe,
                 allowed_boards=list(request.allowed_boards),
@@ -1014,6 +1153,53 @@ class StockMonitorApp:
             error_text = str(e)
             self.root.after(0, lambda: self._log(f"扫描出错: {error_text}"))
             self.root.after(0, lambda: self.scan_finished(f"扫描失败: {error_text}"))
+
+    def update_history_cache(self, request: ScanRequest):
+        try:
+            scan_filter = StockFilter()
+            scan_filter.apply_settings(request.filter_settings)
+            scan_filter.set_log_callback(self._log_async)
+            scan_filter.set_history_source_preference(request.history_source)
+            self._log_async(
+                f"缓存更新参数：数量={'全量' if request.max_stocks <= 0 else request.max_stocks}，并发线程={request.scan_workers}，历史源={request.history_source}"
+            )
+
+            def progress_callback(current, total, code, name):
+                if not self.is_updating_cache:
+                    raise StopIteration
+                progress = (current / total) * 100 if total else 0
+                self.root.after(0, lambda: self.progress_var.set(progress))
+                self.root.after(0, lambda: self.status_var.set(f"更新缓存 {current}/{total}: {code} {name}"))
+
+            result = scan_filter.fetcher.update_history_cache(
+                max_stocks=request.max_stocks,
+                days=max(60, request.filter_settings.ma_period + request.filter_settings.limit_up_lookback_days + 20),
+                source=request.history_source,
+                workers=request.scan_workers,
+                progress_callback=progress_callback,
+                should_stop=lambda: not self.is_updating_cache,
+                refresh_universe=request.refresh_universe,
+                allowed_boards=list(request.allowed_boards),
+            )
+            if not self.is_updating_cache:
+                self.root.after(0, lambda: self._log("历史缓存更新已停止。"))
+                self.root.after(0, lambda: self.scan_finished("历史缓存更新已停止"))
+                return
+            self.root.after(
+                0,
+                lambda res=result: self._log(
+                    f"历史缓存更新完成：总计 {res.get('total', 0)}，成功 {res.get('updated', 0)}，失败 {res.get('failed', 0)}，跳过 {res.get('skipped', 0)}。"
+                ),
+            )
+            self.root.after(0, lambda: self._log(self._history_cache_summary_text()))
+            self.root.after(0, lambda: self.scan_finished("历史缓存更新完成"))
+        except StopIteration:
+            self.root.after(0, lambda: self._log("历史缓存更新已停止。"))
+            self.root.after(0, lambda: self.scan_finished("历史缓存更新已停止"))
+        except Exception as e:
+            error_text = str(e)
+            self.root.after(0, lambda: self._log(f"历史缓存更新出错: {error_text}"))
+            self.root.after(0, lambda: self.scan_finished(f"历史缓存更新失败: {error_text}"))
 
     def _sort_value_for_column(self, item: Dict[str, Any], column: str):
         data = item.get("data", {}) or {}
@@ -1129,10 +1315,13 @@ class StockMonitorApp:
 
     def scan_finished(self, status_text: str = "扫描完成"):
         self.scan_btn.config(state=tk.NORMAL)
+        self.update_cache_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.status_var.set(status_text)
         self.is_scanning = False
+        self.is_updating_cache = False
         self._scan_thread = None
+        self._cache_thread = None
         self._active_scan_request = None
         self.refresh_universe_var.set(False)
         self._close_run_log()
@@ -1899,7 +2088,7 @@ class StockMonitorApp:
     def show_settings(self):
         settings_window = tk.Toplevel(self.root)
         settings_window.title("扫描参数")
-        settings_window.geometry("520x340")
+        settings_window.geometry("560x520")
         settings_window.transient(self.root)
         settings_window.grab_set()
 
@@ -1943,8 +2132,48 @@ class StockMonitorApp:
             row=10, column=0, columnspan=2, pady=8
         )
 
-        ttk.Button(frame, text="保存", command=lambda: settings_window.destroy()).grid(
-            row=11, column=0, columnspan=2, pady=18
+        ttk.Label(frame, text="历史数据源:").grid(row=11, column=0, sticky=tk.E, pady=8)
+        ttk.Combobox(
+            frame,
+            textvariable=self.history_source_var,
+            width=15,
+            state="readonly",
+            values=DATA_SOURCE_OPTIONS["history"],
+        ).grid(row=11, column=1, pady=8)
+
+        ttk.Label(frame, text="分时数据源:").grid(row=12, column=0, sticky=tk.E, pady=8)
+        ttk.Combobox(
+            frame,
+            textvariable=self.intraday_source_var,
+            width=15,
+            state="readonly",
+            values=DATA_SOURCE_OPTIONS["intraday"],
+        ).grid(row=12, column=1, pady=8)
+
+        ttk.Label(frame, text="资金流数据源:").grid(row=13, column=0, sticky=tk.E, pady=8)
+        ttk.Combobox(
+            frame,
+            textvariable=self.fund_flow_source_var,
+            width=15,
+            state="readonly",
+            values=DATA_SOURCE_OPTIONS["fund_flow"],
+        ).grid(row=13, column=1, pady=8)
+
+        ttk.Label(frame, text="涨停原因源:").grid(row=14, column=0, sticky=tk.E, pady=8)
+        ttk.Combobox(
+            frame,
+            textvariable=self.limit_up_reason_source_var,
+            width=15,
+            state="readonly",
+            values=DATA_SOURCE_OPTIONS["limit_up_reason"],
+        ).grid(row=14, column=1, pady=8)
+
+        ttk.Button(
+            frame,
+            text="保存",
+            command=lambda: (self._save_app_settings(), self._apply_source_preferences(), settings_window.destroy()),
+        ).grid(
+            row=15, column=0, columnspan=2, pady=18
         )
 
     def show_about(self):

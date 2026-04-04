@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict
+from data_source_models import HistoryRequestPlan
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,7 @@ class ScanRequest:
     filter_settings: FilterSettings
     max_stocks: int = 0
     scan_workers: int = 3
+    history_source: str = "auto"
     allowed_boards: tuple[str, ...] = ()
     refresh_universe: bool = False
     ignore_result_snapshot: bool = False
@@ -42,6 +44,7 @@ class ScanRequest:
                 "allowed_boards": sorted(
                     {str(board).strip() for board in self.allowed_boards if str(board).strip()}
                 ),
+                "history_source": str(self.history_source or "auto").strip().lower() or "auto",
                 "max_stocks": int(self.max_stocks),
             }
         )
