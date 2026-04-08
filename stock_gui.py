@@ -866,50 +866,68 @@ class StockMonitorApp:
         self._zt_yesterday_var = tk.StringVar()
         ttk.Entry(action_bar, textvariable=self._zt_yesterday_var, width=10).pack(side=tk.LEFT)
         ttk.Label(action_bar, text="(昨日留空自动推断)").pack(side=tk.LEFT, padx=4)
+        self._zt_status_label = ttk.Label(action_bar, text="")
+        self._zt_status_label.pack(side=tk.RIGHT, padx=8)
 
         # ---- 主区域：左侧摘要 + 右侧表格 ----
         body = ttk.PanedWindow(compare_frame, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True)
 
         # 左侧：摘要面板
-        summary_frame = ttk.LabelFrame(body, text="对比摘要", padding="6")
-        self._zt_summary_text = scrolledtext.ScrolledText(summary_frame, width=40, height=30, wrap=tk.WORD)
+        summary_frame = ttk.LabelFrame(body, text="对比摘要 + 形态分布", padding="6")
+        self._zt_summary_text = scrolledtext.ScrolledText(summary_frame, width=42, height=30, wrap=tk.WORD)
         self._zt_summary_text.pack(fill=tk.BOTH, expand=True)
-        self._zt_summary_text.insert(tk.END, "点击「获取涨停对比」开始分析")
+        self._zt_summary_text.insert(tk.END, "点击「获取涨停对比」开始分析\n\n"
+            "分析每只涨停股的技术形态:\n"
+            "  - 回踩MA5涨停: 前日触及五日线后反弹\n"
+            "  - 超跌反弹涨停: 下跌趋势中突然涨停\n"
+            "  - 趋势加速涨停: 均线多头中涨停加速\n"
+            "  - 高位连板: 连续涨停\n"
+            "  - 突破平台涨停: 横盘整理后突破\n"
+            "  - 首板低位涨停: 低位首次涨停\n")
         self._zt_summary_text.config(state=tk.DISABLED)
-        body.add(summary_frame, weight=1)
+        body.add(summary_frame, weight=2)
 
-        # 右侧：今日首板 / 昨日首板表格（Notebook 切换）
+        # 右侧：表格区
         table_frame = ttk.Frame(body)
         self._zt_table_nb = ttk.Notebook(table_frame)
         self._zt_table_nb.pack(fill=tk.BOTH, expand=True)
 
-        # 今日首板 Tab
-        today_tab = ttk.Frame(self._zt_table_nb)
-        self._zt_table_nb.add(today_tab, text="今日首板")
-        zt_cols_today = ("code", "name", "industry", "change_pct", "close", "first_time", "break_count", "turnover")
-        self._zt_today_tree = ttk.Treeview(today_tab, columns=zt_cols_today, show="headings", height=20)
+        # 今日涨停形态分类 Tab（核心表格）
+        pattern_tab = ttk.Frame(self._zt_table_nb)
+        self._zt_table_nb.add(pattern_tab, text="今日涨停形态分类")
+        zt_pattern_cols = ("code", "name", "industry", "pattern", "change_pct", "close",
+                           "dist_ma5", "trend_10d", "pos_60d", "detail")
+        self._zt_pattern_tree = ttk.Treeview(pattern_tab, columns=zt_pattern_cols, show="headings", height=22)
         for col, (heading, w) in {
-            "code": ("代码", 80), "name": ("名称", 100), "industry": ("行业", 100),
-            "change_pct": ("涨跌幅%", 80), "close": ("最新价", 80),
-            "first_time": ("首封时间", 80), "break_count": ("炸板", 60), "turnover": ("换手率%", 80),
+            "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
+            "pattern": ("技术形态", 110), "change_pct": ("涨跌幅%", 70), "close": ("最新价", 70),
+            "dist_ma5": ("距MA5%", 70), "trend_10d": ("10日涨幅%", 80),
+            "pos_60d": ("60日分位%", 80), "detail": ("形态说明", 220),
         }.items():
-            self._zt_today_tree.heading(col, text=heading)
-            self._zt_today_tree.column(col, width=w, anchor=tk.CENTER)
-        sb1 = ttk.Scrollbar(today_tab, orient=tk.VERTICAL, command=self._zt_today_tree.yview)
-        self._zt_today_tree.configure(yscrollcommand=sb1.set)
-        sb1.pack(side=tk.RIGHT, fill=tk.Y)
-        self._zt_today_tree.pack(fill=tk.BOTH, expand=True)
+            self._zt_pattern_tree.heading(col, text=heading)
+            self._zt_pattern_tree.column(col, width=w, anchor=tk.CENTER if col != "detail" else tk.W)
+        sb_p = ttk.Scrollbar(pattern_tab, orient=tk.VERTICAL, command=self._zt_pattern_tree.yview)
+        self._zt_pattern_tree.configure(yscrollcommand=sb_p.set)
+        sb_p.pack(side=tk.RIGHT, fill=tk.Y)
+        self._zt_pattern_tree.pack(fill=tk.BOTH, expand=True)
+        # 行标签色
+        self._zt_pattern_tree.tag_configure("pat_ma5", background="#e8f5e9")
+        self._zt_pattern_tree.tag_configure("pat_oversold", background="#fff3e0")
+        self._zt_pattern_tree.tag_configure("pat_trend", background="#e3f2fd")
+        self._zt_pattern_tree.tag_configure("pat_streak", background="#fce4ec")
+        self._zt_pattern_tree.tag_configure("pat_breakout", background="#f3e5f5")
+        self._zt_pattern_tree.tag_configure("pat_lowpos", background="#e0f7fa")
 
-        # 昨日首板 Tab
+        # 昨日首板今日表现 Tab
         yest_tab = ttk.Frame(self._zt_table_nb)
         self._zt_table_nb.add(yest_tab, text="昨日首板今日表现")
-        zt_cols_yest = ("code", "name", "industry", "today_chg", "close", "still_zt", "status")
-        self._zt_yest_tree = ttk.Treeview(yest_tab, columns=zt_cols_yest, show="headings", height=20)
+        zt_cols_yest = ("code", "name", "industry", "pattern", "today_chg", "close", "still_zt", "status")
+        self._zt_yest_tree = ttk.Treeview(yest_tab, columns=zt_cols_yest, show="headings", height=22)
         for col, (heading, w) in {
-            "code": ("代码", 80), "name": ("名称", 100), "industry": ("行业", 100),
-            "today_chg": ("今日涨跌%", 90), "close": ("最新价", 80),
-            "still_zt": ("继续涨停", 80), "status": ("状态", 80),
+            "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
+            "pattern": ("昨日形态", 110), "today_chg": ("今日涨跌%", 80), "close": ("最新价", 70),
+            "still_zt": ("继续涨停", 70), "status": ("状态", 70),
         }.items():
             self._zt_yest_tree.heading(col, text=heading)
             self._zt_yest_tree.column(col, width=w, anchor=tk.CENTER)
@@ -918,36 +936,28 @@ class StockMonitorApp:
         sb2.pack(side=tk.RIGHT, fill=tk.Y)
         self._zt_yest_tree.pack(fill=tk.BOTH, expand=True)
 
-        # 新增首板 Tab
-        new_tab = ttk.Frame(self._zt_table_nb)
-        self._zt_table_nb.add(new_tab, text="今日新增首板")
-        self._zt_new_tree = ttk.Treeview(new_tab, columns=zt_cols_today, show="headings", height=20)
-        for col, (heading, w) in {
-            "code": ("代码", 80), "name": ("名称", 100), "industry": ("行业", 100),
-            "change_pct": ("涨跌幅%", 80), "close": ("最新价", 80),
-            "first_time": ("首封时间", 80), "break_count": ("炸板", 60), "turnover": ("换手率%", 80),
-        }.items():
-            self._zt_new_tree.heading(col, text=heading)
-            self._zt_new_tree.column(col, width=w, anchor=tk.CENTER)
-        sb3 = ttk.Scrollbar(new_tab, orient=tk.VERTICAL, command=self._zt_new_tree.yview)
-        self._zt_new_tree.configure(yscrollcommand=sb3.set)
-        sb3.pack(side=tk.RIGHT, fill=tk.Y)
-        self._zt_new_tree.pack(fill=tk.BOTH, expand=True)
-
-        body.add(table_frame, weight=3)
+        body.add(table_frame, weight=4)
 
         self._zt_compare_thread = None
         self._zt_compare_result: Optional[Dict[str, Any]] = None
 
+    _ZT_PATTERN_TAG_MAP = {
+        "回踩MA5涨停": "pat_ma5",
+        "超跌反弹涨停": "pat_oversold",
+        "趋势加速涨停": "pat_trend",
+        "高位连板": "pat_streak",
+        "突破平台涨停": "pat_breakout",
+        "首板低位涨停": "pat_lowpos",
+    }
+
     def _estimate_yesterday(self, today_str: str) -> str:
-        """根据今日日期估算上一个交易日。"""
         from datetime import timedelta
         try:
             d = datetime.strptime(today_str.strip(), "%Y%m%d").date()
         except (ValueError, TypeError):
             d = datetime.now().date()
         d -= timedelta(days=1)
-        while d.weekday() >= 5:  # skip weekend
+        while d.weekday() >= 5:
             d -= timedelta(days=1)
         return d.strftime("%Y%m%d")
 
@@ -965,8 +975,9 @@ class StockMonitorApp:
 
         self._zt_summary_text.config(state=tk.NORMAL)
         self._zt_summary_text.delete("1.0", tk.END)
-        self._zt_summary_text.insert(tk.END, f"正在获取 {today} vs {yesterday} 涨停对比数据...\n")
+        self._zt_summary_text.insert(tk.END, f"正在获取 {today} vs {yesterday} 涨停数据...\n")
         self._zt_summary_text.config(state=tk.DISABLED)
+        self._zt_status_label.config(text="获取涨停池...")
         self.status_var.set("正在获取涨停对比...")
 
         self._zt_compare_thread = threading.Thread(
@@ -976,7 +987,31 @@ class StockMonitorApp:
 
     def _load_limit_up_compare(self, today: str, yesterday: str):
         try:
+            # 阶段1：获取涨停池对比数据
             result = self.stock_filter.fetcher.compare_limit_up_pools(today, yesterday)
+            self.root.after(0, lambda: self._zt_status_label.config(
+                text=f"涨停池获取完成，正在分析今日 {len(result.get('today_first', []))} 只首板形态..."
+            ))
+
+            # 阶段2：对今日首板做技术形态分类
+            today_first = result.get("today_first", [])
+            def _progress(cur, tot, info):
+                self.root.after(0, lambda c=cur, t=tot, i=info:
+                    self._zt_status_label.config(text=f"分类今日首板 {c}/{t}: {i}"))
+            today_classified = self.stock_filter.classify_limit_up_pool(today_first, progress_callback=_progress)
+            result["today_classified"] = today_classified
+
+            # 阶段3：对昨日首板做技术形态分类
+            yesterday_first = result.get("yesterday_first", [])
+            if yesterday_first:
+                self.root.after(0, lambda: self._zt_status_label.config(
+                    text=f"正在分析昨日 {len(yesterday_first)} 只首板形态..."))
+                def _progress2(cur, tot, info):
+                    self.root.after(0, lambda c=cur, t=tot, i=info:
+                        self._zt_status_label.config(text=f"分类昨日首板 {c}/{t}: {i}"))
+                yesterday_classified = self.stock_filter.classify_limit_up_pool(yesterday_first, progress_callback=_progress2)
+                result["yesterday_classified"] = yesterday_classified
+
             self.root.after(0, lambda r=result: self._apply_limit_up_compare(r))
         except Exception as e:
             err = str(e)
@@ -987,79 +1022,110 @@ class StockMonitorApp:
         self._zt_summary_text.delete("1.0", tk.END)
         self._zt_summary_text.insert(tk.END, msg)
         self._zt_summary_text.config(state=tk.DISABLED)
+        self._zt_status_label.config(text="")
         self.status_var.set("涨停对比失败")
 
     def _apply_limit_up_compare(self, result: Dict[str, Any]):
         self._zt_compare_result = result
+        today_classified = result.get("today_classified", [])
+        yesterday_classified = result.get("yesterday_classified", [])
+
+        # ---- 统计形态分布 ----
+        pattern_counts_today: Dict[str, int] = {}
+        for rec in today_classified:
+            p = rec.get("pattern", "其他涨停")
+            pattern_counts_today[p] = pattern_counts_today.get(p, 0) + 1
+
+        pattern_counts_yest: Dict[str, int] = {}
+        for rec in yesterday_classified:
+            p = rec.get("pattern", "其他涨停")
+            pattern_counts_yest[p] = pattern_counts_yest.get(p, 0) + 1
 
         # ---- 填充摘要 ----
         self._zt_summary_text.config(state=tk.NORMAL)
         self._zt_summary_text.delete("1.0", tk.END)
-        summary = result.get("summary", "")
-        self._zt_summary_text.insert(tk.END, summary + "\n")
+        txt = self._zt_summary_text
 
-        # 行业分布详情
+        txt.insert(tk.END, result.get("summary", "") + "\n")
+
+        txt.insert(tk.END, f"\n{'='*36}\n")
+        txt.insert(tk.END, f"  今日首板形态分布 ({len(today_classified)} 只)\n")
+        txt.insert(tk.END, f"{'='*36}\n")
+        for p, c in sorted(pattern_counts_today.items(), key=lambda x: -x[1]):
+            pct = c / max(len(today_classified), 1) * 100
+            bar = "#" * int(pct / 3)
+            txt.insert(tk.END, f"  {p:10s}  {c:3d} 只  {pct:5.1f}%  {bar}\n")
+
+        if pattern_counts_yest:
+            txt.insert(tk.END, f"\n{'='*36}\n")
+            txt.insert(tk.END, f"  昨日首板形态分布 ({len(yesterday_classified)} 只)\n")
+            txt.insert(tk.END, f"{'='*36}\n")
+            for p, c in sorted(pattern_counts_yest.items(), key=lambda x: -x[1]):
+                pct = c / max(len(yesterday_classified), 1) * 100
+                bar = "#" * int(pct / 3)
+                txt.insert(tk.END, f"  {p:10s}  {c:3d} 只  {pct:5.1f}%  {bar}\n")
+
+            # 形态变化对比
+            all_patterns = sorted(set(list(pattern_counts_today.keys()) + list(pattern_counts_yest.keys())))
+            txt.insert(tk.END, f"\n{'='*36}\n")
+            txt.insert(tk.END, "  形态变化（今日 vs 昨日）\n")
+            txt.insert(tk.END, f"{'='*36}\n")
+            for p in all_patterns:
+                t = pattern_counts_today.get(p, 0)
+                y = pattern_counts_yest.get(p, 0)
+                delta = t - y
+                arrow = "+" if delta > 0 else ""
+                txt.insert(tk.END, f"  {p:10s}  {y:2d} → {t:2d}  ({arrow}{delta})\n")
+
+        # 行业分布
         ind_today = result.get("industry_today", {})
         ind_yest = result.get("industry_yesterday", {})
-        ind_new = result.get("industry_new", {})
         if ind_today:
-            self._zt_summary_text.insert(tk.END, "\n── 今日首板行业分布 ──\n")
-            for k, v in sorted(ind_today.items(), key=lambda x: -x[1]):
-                self._zt_summary_text.insert(tk.END, f"  {k}: {v} 只\n")
+            txt.insert(tk.END, "\n── 今日首板 TOP 行业 ──\n")
+            for k, v in sorted(ind_today.items(), key=lambda x: -x[1])[:8]:
+                txt.insert(tk.END, f"  {k}: {v} 只\n")
         if ind_yest:
-            self._zt_summary_text.insert(tk.END, "\n── 昨日首板行业分布 ──\n")
-            for k, v in sorted(ind_yest.items(), key=lambda x: -x[1]):
-                self._zt_summary_text.insert(tk.END, f"  {k}: {v} 只\n")
-        if ind_new:
-            self._zt_summary_text.insert(tk.END, "\n── 今日新增首板行业 ──\n")
-            for k, v in sorted(ind_new.items(), key=lambda x: -x[1]):
-                self._zt_summary_text.insert(tk.END, f"  {k}: {v} 只\n")
+            txt.insert(tk.END, "\n── 昨日首板 TOP 行业 ──\n")
+            for k, v in sorted(ind_yest.items(), key=lambda x: -x[1])[:8]:
+                txt.insert(tk.END, f"  {k}: {v} 只\n")
 
-        # 晋级明细
         continued = result.get("continued_codes", [])
         lost = result.get("lost_codes", [])
         if continued:
-            self._zt_summary_text.insert(tk.END, f"\n── 昨日首板→今日继续涨停 ({len(continued)}) ──\n")
-            self._zt_summary_text.insert(tk.END, "  " + ", ".join(continued) + "\n")
+            txt.insert(tk.END, f"\n── 昨日首板→今日继续涨停 ({len(continued)}) ──\n")
+            txt.insert(tk.END, "  " + ", ".join(continued) + "\n")
         if lost:
-            self._zt_summary_text.insert(tk.END, f"\n── 昨日首板→今日未涨停 ({len(lost)}) ──\n")
-            self._zt_summary_text.insert(tk.END, "  " + ", ".join(lost) + "\n")
-
+            txt.insert(tk.END, f"\n── 昨日首板→今日未涨停 ({len(lost)}) ──\n")
+            txt.insert(tk.END, "  " + ", ".join(lost) + "\n")
         self._zt_summary_text.config(state=tk.DISABLED)
 
-        # ---- 填充今日首板表格 ----
-        new_codes_set = set(result.get("new_codes", []))
-        self._zt_today_tree.delete(*self._zt_today_tree.get_children())
-        self._zt_new_tree.delete(*self._zt_new_tree.get_children())
-        for rec in result.get("today_first", []):
-            ft = str(rec.get("first_time", "") or "")
-            if len(ft) >= 4:
-                ft = ft[:2] + ":" + ft[2:4] if len(ft) <= 4 else ft[:2] + ":" + ft[2:4] + ":" + ft[4:]
+        # ---- 填充今日涨停形态分类表格 ----
+        self._zt_pattern_tree.delete(*self._zt_pattern_tree.get_children())
+        for rec in sorted(today_classified, key=lambda r: r.get("pattern", "")):
+            tag = self._ZT_PATTERN_TAG_MAP.get(rec.get("pattern", ""), "")
             vals = (
                 rec.get("code", ""),
                 rec.get("name", ""),
                 rec.get("industry", ""),
+                rec.get("pattern", ""),
                 f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
                 f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
-                ft,
-                str(rec.get("break_count", 0)),
-                f"{rec['turnover']:.2f}" if rec.get("turnover") is not None else "-",
+                f"{rec['distance_ma5_pct']:+.1f}" if rec.get("distance_ma5_pct") is not None else "-",
+                f"{rec['trend_10d_pct']:+.1f}" if rec.get("trend_10d_pct") is not None else "-",
+                f"{rec['position_60d_pct']:.0f}" if rec.get("position_60d_pct") is not None else "-",
+                rec.get("pattern_detail", ""),
             )
-            self._zt_today_tree.insert("", tk.END, values=vals)
-            if rec.get("code", "") in new_codes_set:
-                self._zt_new_tree.insert("", tk.END, values=vals)
+            self._zt_pattern_tree.insert("", tk.END, values=vals, tags=(tag,) if tag else ())
 
-        # ---- 填充昨日首板今日表现表格 ----
+        # ---- 填充昨日首板今日表现表格（带形态） ----
         self._zt_yest_tree.delete(*self._zt_yest_tree.get_children())
-        yest_first = result.get("yesterday_first", [])
-        perf_map = {}
-        for p in result.get("yesterday_first_today_performance", []):
-            perf_map[p["code"]] = p
-        for rec in yest_first:
+        yest_class_map = {r["code"]: r for r in yesterday_classified}
+        perf_map = {p["code"]: p for p in result.get("yesterday_first_today_performance", [])}
+        for rec in yesterday_classified:
             code = rec.get("code", "")
             perf = perf_map.get(code, {})
             chg = perf.get("change_pct")
-            close = perf.get("close")
+            close_val = perf.get("close")
             still = perf.get("still_limit_up", False)
             if still:
                 status = "晋级"
@@ -1067,19 +1133,23 @@ class StockMonitorApp:
                 status = "高开"
             elif chg is not None and chg < -3:
                 status = "大跌"
+            elif chg is not None:
+                status = "平开" if chg >= -1 else "低开"
             else:
-                status = "平开"
+                status = "-"
             vals = (
                 code,
                 rec.get("name", ""),
                 rec.get("industry", ""),
+                rec.get("pattern", ""),
                 f"{chg:.2f}" if chg is not None else "-",
-                f"{close:.2f}" if close is not None else rec.get("close", "-"),
+                f"{close_val:.2f}" if close_val is not None else "-",
                 "是" if still else "否",
                 status,
             )
             self._zt_yest_tree.insert("", tk.END, values=vals)
 
+        self._zt_status_label.config(text="")
         self.status_var.set("涨停对比完成")
 
     def setup_log_tab(self):

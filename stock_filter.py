@@ -1079,6 +1079,188 @@ class StockFilter:
             task_name=f"补充详情历史 {code}",
         )
 
+    # ================= 涨停技术形态分类 =================
+
+    def classify_limit_up_pattern(
+        self,
+        stock_code: str,
+        board: str = "",
+        stock_name: str = "",
+    ) -> Dict[str, Any]:
+        """对涨停股进行技术形态分类，返回形态标签和详细指标。
+
+        形态类型:
+        - 回踩MA5涨停: 前一日或前两日收盘接近/低于MA5，涨停日拉回
+        - 超跌反弹涨停: 近10日跌幅>10%，或收盘在MA20以下
+        - 趋势加速涨停: MA5>MA10>MA20 多头排列，涨停加速
+        - 高位连板: 连板数>=2
+        - 突破平台涨停: 近10日振幅小（横盘），涨停突破
+        - 首板低位涨停: 股价在近60日低位（<30%分位）
+        - 其他涨停: 不符合以上任何分类
+        """
+        code = str(stock_code).strip().zfill(6)
+        result: Dict[str, Any] = {
+            "code": code,
+            "pattern": "其他涨停",
+            "pattern_detail": "",
+            "ma5": None,
+            "ma10": None,
+            "ma20": None,
+            "close": None,
+            "prev_close": None,
+            "change_pct": None,
+            "distance_ma5_pct": None,
+            "trend_10d_pct": None,
+            "position_60d_pct": None,
+            "volatility_10d": None,
+            "consecutive_boards": 0,
+        }
+
+        history = self._call_with_timeout(
+            lambda: self.fetcher.get_history_data(code, days=65),
+            timeout_sec=10.0,
+            fallback=None,
+            task_name=f"涨停分类 {code}",
+        )
+        if history is None or history.empty or len(history) < 10:
+            result["pattern"] = "数据不足"
+            return result
+
+        df = history.sort_values("date").reset_index(drop=True)
+        close = pd.to_numeric(df["close"], errors="coerce")
+        change_pct = pd.to_numeric(df.get("change_pct"), errors="coerce") if "change_pct" in df.columns else pd.Series(dtype=float)
+
+        ma5 = close.rolling(5, min_periods=5).mean()
+        ma10 = close.rolling(10, min_periods=10).mean()
+        ma20 = close.rolling(20, min_periods=20).mean()
+
+        latest_close = float(close.iloc[-1]) if not pd.isna(close.iloc[-1]) else None
+        prev_close = float(close.iloc[-2]) if len(close) >= 2 and not pd.isna(close.iloc[-2]) else None
+        latest_ma5 = float(ma5.iloc[-1]) if not pd.isna(ma5.iloc[-1]) else None
+        latest_ma10 = float(ma10.iloc[-1]) if not pd.isna(ma10.iloc[-1]) else None
+        latest_ma20 = float(ma20.iloc[-1]) if not pd.isna(ma20.iloc[-1]) else None
+        prev_ma5 = float(ma5.iloc[-2]) if len(ma5) >= 2 and not pd.isna(ma5.iloc[-2]) else None
+
+        result["close"] = latest_close
+        result["prev_close"] = prev_close
+        result["ma5"] = latest_ma5
+        result["ma10"] = latest_ma10
+        result["ma20"] = latest_ma20
+        if not change_pct.empty and not pd.isna(change_pct.iloc[-1]):
+            result["change_pct"] = float(change_pct.iloc[-1])
+
+        # 距MA5百分比
+        if latest_close and latest_ma5 and latest_ma5 > 0:
+            result["distance_ma5_pct"] = round((latest_close / latest_ma5 - 1) * 100, 2)
+
+        # 10日涨跌幅
+        if len(close) >= 11 and not pd.isna(close.iloc[-11]) and close.iloc[-11] > 0:
+            result["trend_10d_pct"] = round((float(close.iloc[-1]) / float(close.iloc[-11]) - 1) * 100, 2)
+
+        # 60日位置分位
+        if len(close) >= 20:
+            window = close.tail(min(60, len(close)))
+            window_valid = window.dropna()
+            if len(window_valid) >= 10 and latest_close is not None:
+                rank = float((window_valid < latest_close).sum()) / len(window_valid) * 100
+                result["position_60d_pct"] = round(rank, 1)
+
+        # 近10日振幅（用于判断横盘）
+        if len(close) >= 11:
+            recent_10 = close.iloc[-11:-1].dropna()
+            if len(recent_10) >= 5 and recent_10.mean() > 0:
+                result["volatility_10d"] = round(float(recent_10.std() / recent_10.mean() * 100), 2)
+
+        # 连板数
+        threshold = self._limit_up_threshold(board=board, stock_name=stock_name)
+        if not change_pct.empty:
+            mask = (change_pct >= (threshold - 0.2)).fillna(False)
+            streak = self._calculate_limit_up_streak(mask)
+            result["consecutive_boards"] = streak
+
+        # ---- 分类逻辑（优先级从高到低）----
+        streak = result["consecutive_boards"]
+        dist_ma5 = result["distance_ma5_pct"]
+        trend_10d = result["trend_10d_pct"]
+        pos_60d = result["position_60d_pct"]
+        vol_10d = result["volatility_10d"]
+
+        if streak >= 2:
+            result["pattern"] = "高位连板"
+            result["pattern_detail"] = f"连板{streak}板"
+
+        elif (prev_close is not None and prev_ma5 is not None and prev_close <= prev_ma5 * 1.01
+              and dist_ma5 is not None and dist_ma5 > 0):
+            result["pattern"] = "回踩MA5涨停"
+            detail_parts = []
+            if prev_close and prev_ma5:
+                detail_parts.append(f"前日收盘{prev_close:.2f}/MA5 {prev_ma5:.2f}")
+            result["pattern_detail"] = "，".join(detail_parts)
+
+        elif (trend_10d is not None and trend_10d < -10) or (
+            latest_close is not None and latest_ma20 is not None and latest_close < latest_ma20
+        ):
+            result["pattern"] = "超跌反弹涨停"
+            parts = []
+            if trend_10d is not None:
+                parts.append(f"10日跌{trend_10d:.1f}%")
+            if latest_close and latest_ma20 and latest_close < latest_ma20:
+                parts.append(f"低于MA20({latest_ma20:.2f})")
+            result["pattern_detail"] = "，".join(parts)
+
+        elif (latest_ma5 is not None and latest_ma10 is not None and latest_ma20 is not None
+              and latest_ma5 > latest_ma10 > latest_ma20):
+            result["pattern"] = "趋势加速涨停"
+            result["pattern_detail"] = f"MA5({latest_ma5:.2f})>MA10({latest_ma10:.2f})>MA20({latest_ma20:.2f})"
+
+        elif vol_10d is not None and vol_10d < 2.0:
+            result["pattern"] = "突破平台涨停"
+            result["pattern_detail"] = f"近10日波动率仅{vol_10d:.2f}%，横盘后突破"
+
+        elif pos_60d is not None and pos_60d < 30:
+            result["pattern"] = "首板低位涨停"
+            result["pattern_detail"] = f"60日分位{pos_60d:.0f}%"
+
+        else:
+            result["pattern"] = "其他涨停"
+            parts = []
+            if dist_ma5 is not None:
+                parts.append(f"距MA5 {dist_ma5:+.1f}%")
+            if trend_10d is not None:
+                parts.append(f"10日{trend_10d:+.1f}%")
+            result["pattern_detail"] = "，".join(parts) if parts else ""
+
+        return result
+
+    def classify_limit_up_pool(
+        self,
+        pool_records: List[Dict[str, Any]],
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    ) -> List[Dict[str, Any]]:
+        """对涨停池中的每只股票进行技术形态分类。"""
+        results: List[Dict[str, Any]] = []
+        total = len(pool_records)
+        for idx, rec in enumerate(pool_records):
+            code = str(rec.get("code", "")).strip().zfill(6)
+            name = str(rec.get("name", ""))
+            industry = str(rec.get("industry", ""))
+            classification = self.classify_limit_up_pattern(
+                code,
+                board=rec.get("board", ""),
+                stock_name=name,
+            )
+            classification["name"] = name
+            classification["industry"] = industry
+            # 保留原始池子信息
+            for key in ("amount", "market_cap", "turnover", "first_board_time",
+                         "last_board_time", "break_count", "board_amount"):
+                if key in rec:
+                    classification[key] = rec[key]
+            results.append(classification)
+            if progress_callback:
+                progress_callback(idx + 1, total, f"{code} {name}")
+        return results
+
     def _resolve_intraday_prev_close(
         self,
         history_df: Optional[pd.DataFrame],
