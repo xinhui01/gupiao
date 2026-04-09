@@ -82,6 +82,10 @@ _apply_network_patches()
 import pandas as pd
 import akshare as ak
 
+from stock_logger import get_logger
+
+logger = get_logger(__name__)
+
 from stock_store import (
     clear_history as clear_history_store,
     clear_scan_snapshots,
@@ -304,8 +308,88 @@ _EASTMONEY_HISTORY_MIRRORS = [
     "https://90.push2his.eastmoney.com/api/qt/stock/kline/get",
     "https://95.push2his.eastmoney.com/api/qt/stock/kline/get",
 ]
-_HISTORY_MIRROR_HEALTH: Dict[str, float] = {}
-_HISTORY_MIRROR_HEALTH_LOCK = threading.Lock()
+# ---- 全局主机健康管理器 ----
+# 所有数据源（eastmoney / tencent / sina）共用同一个健康状态池，
+# 任何主机失败一次即进入冷却，冷却期间所有调用方自动跳过该主机。
+_GLOBAL_HOST_HEALTH: Dict[str, float] = {}  # host → cooldown_until timestamp
+_GLOBAL_HOST_HEALTH_LOCK = threading.Lock()
+_GLOBAL_HOST_FAIL_COUNT: Dict[str, int] = {}  # host → consecutive fail count
+
+
+def _global_host_cooldown_sec() -> float:
+    """全局主机冷却时间，默认 1 小时。可通过环境变量 GUPPIAO_HOST_COOLDOWN_SEC 配置。"""
+    raw = os.environ.get("GUPPIAO_HOST_COOLDOWN_SEC", "").strip()
+    if not raw:
+        raw = os.environ.get("GUPPIAO_HISTORY_HOST_COOLDOWN_SEC", "").strip()
+    try:
+        value = float(raw) if raw else 3600.0
+    except ValueError:
+        value = 3600.0
+    return max(60.0, min(value, 7200.0))
+
+
+def _global_mark_host_failed(url_or_host: str) -> None:
+    """标记主机失败，进入冷却。连续失败次数越多，冷却时间越长。"""
+    host = re.sub(r"^https?://", "", str(url_or_host or "").strip()).split("/", 1)[0].lower()
+    if not host:
+        return
+    base_cooldown = _global_host_cooldown_sec()
+    with _GLOBAL_HOST_HEALTH_LOCK:
+        count = _GLOBAL_HOST_FAIL_COUNT.get(host, 0) + 1
+        _GLOBAL_HOST_FAIL_COUNT[host] = count
+        # 首次失败: base_cooldown, 第二次: 2x, 第三次+: 3x (上限 3 小时)
+        multiplier = min(count, 3)
+        cooldown = min(base_cooldown * multiplier, 10800.0)
+        _GLOBAL_HOST_HEALTH[host] = time.time() + cooldown
+
+
+def _global_mark_host_ok(url_or_host: str) -> None:
+    """标记主机成功，清除冷却状态和失败计数。"""
+    host = re.sub(r"^https?://", "", str(url_or_host or "").strip()).split("/", 1)[0].lower()
+    if not host:
+        return
+    with _GLOBAL_HOST_HEALTH_LOCK:
+        _GLOBAL_HOST_HEALTH.pop(host, None)
+        _GLOBAL_HOST_FAIL_COUNT.pop(host, None)
+
+
+def _global_host_on_cooldown(url_or_host: str, now: Optional[float] = None) -> bool:
+    """检查主机是否正在冷却中。"""
+    host = re.sub(r"^https?://", "", str(url_or_host or "").strip()).split("/", 1)[0].lower()
+    if not host:
+        return False
+    if now is None:
+        now = time.time()
+    with _GLOBAL_HOST_HEALTH_LOCK:
+        cooldown_until = _GLOBAL_HOST_HEALTH.get(host, 0.0)
+        if cooldown_until <= now:
+            _GLOBAL_HOST_HEALTH.pop(host, None)
+            _GLOBAL_HOST_FAIL_COUNT.pop(host, None)
+            return False
+        return True
+
+
+def _global_host_cooldown_remaining(url_or_host: str) -> float:
+    """返回主机剩余冷却秒数，0 表示不在冷却中。"""
+    host = re.sub(r"^https?://", "", str(url_or_host or "").strip()).split("/", 1)[0].lower()
+    if not host:
+        return 0.0
+    now = time.time()
+    with _GLOBAL_HOST_HEALTH_LOCK:
+        cooldown_until = _GLOBAL_HOST_HEALTH.get(host, 0.0)
+        remain = cooldown_until - now
+        return max(0.0, remain)
+
+
+def _global_filter_healthy_urls(urls: List[str]) -> List[str]:
+    """从 URL 列表中过滤掉正在冷却的主机。"""
+    now = time.time()
+    return [u for u in urls if not _global_host_on_cooldown(u, now)]
+
+
+# 兼容旧接口：将旧的分散变量指向全局管理器
+_HISTORY_MIRROR_HEALTH = _GLOBAL_HOST_HEALTH
+_HISTORY_MIRROR_HEALTH_LOCK = _GLOBAL_HOST_HEALTH_LOCK
 _HISTORY_BLOCK_LOCK = threading.Lock()
 _HISTORY_BLOCKED_UNTIL = 0.0
 _HISTORY_BLOCK_EVENTS: List[float] = []
@@ -935,34 +1019,15 @@ def _history_mirror_host(url: str) -> str:
 
 
 def _mark_history_mirror_failed(url: str) -> None:
-    host = _history_mirror_host(url)
-    if not host:
-        return
-    cooldown_until = time.time() + _history_host_cooldown_sec()
-    with _HISTORY_MIRROR_HEALTH_LOCK:
-        _HISTORY_MIRROR_HEALTH[host] = cooldown_until
+    _global_mark_host_failed(url)
 
 
 def _mark_history_mirror_ok(url: str) -> None:
-    host = _history_mirror_host(url)
-    if not host:
-        return
-    with _HISTORY_MIRROR_HEALTH_LOCK:
-        _HISTORY_MIRROR_HEALTH.pop(host, None)
+    _global_mark_host_ok(url)
 
 
 def _history_mirror_on_cooldown(url: str, now: Optional[float] = None) -> bool:
-    host = _history_mirror_host(url)
-    if not host:
-        return False
-    current = time.time() if now is None else now
-    with _HISTORY_MIRROR_HEALTH_LOCK:
-        cooldown_until = _HISTORY_MIRROR_HEALTH.get(host, 0.0)
-        if cooldown_until <= current:
-            if host in _HISTORY_MIRROR_HEALTH:
-                _HISTORY_MIRROR_HEALTH.pop(host, None)
-            return False
-        return True
+    return _global_host_on_cooldown(url, now)
 
 
 def _prioritize_history_mirrors(
@@ -1108,34 +1173,19 @@ _TENCENT_HISTORY_MIRRORS = [
     "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get",
     "https://web.ifzqgtimg.cn/appstock/app/fqkline/get",
 ]
-_TENCENT_MIRROR_HEALTH: Dict[str, float] = {}
-_TENCENT_MIRROR_HEALTH_LOCK = threading.Lock()
-
+# 腾讯镜像健康状态：委托给全局主机管理器
 
 def _mark_tencent_mirror_failed(url: str) -> None:
-    host = re.sub(r"^https?://", "", str(url or "").strip()).split("/", 1)[0]
-    if not host:
-        return
-    with _TENCENT_MIRROR_HEALTH_LOCK:
-        _TENCENT_MIRROR_HEALTH[host] = time.time() + 120.0
+    _global_mark_host_failed(url)
 
 
 def _mark_tencent_mirror_ok(url: str) -> None:
-    host = re.sub(r"^https?://", "", str(url or "").strip()).split("/", 1)[0]
-    with _TENCENT_MIRROR_HEALTH_LOCK:
-        _TENCENT_MIRROR_HEALTH.pop(host, None)
+    _global_mark_host_ok(url)
 
 
 def _get_healthy_tencent_mirrors() -> List[str]:
-    now = time.time()
-    result: List[str] = []
-    with _TENCENT_MIRROR_HEALTH_LOCK:
-        for url in _TENCENT_HISTORY_MIRRORS:
-            host = re.sub(r"^https?://", "", str(url or "").strip()).split("/", 1)[0]
-            cooldown_until = _TENCENT_MIRROR_HEALTH.get(host, 0)
-            if cooldown_until <= now:
-                result.append(url)
-    return result if result else list(_TENCENT_HISTORY_MIRRORS)
+    healthy = _global_filter_healthy_urls(_TENCENT_HISTORY_MIRRORS)
+    return healthy if healthy else list(_TENCENT_HISTORY_MIRRORS)
 
 
 def _fetch_tencent_hist_direct(
@@ -1257,13 +1307,17 @@ def _sina_throttle() -> None:
 
 
 def _fetch_sina_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
-    """新浪历史日线：带 UA 随机化 + 独立节流 + 重试。"""
+    """新浪历史日线：带 UA 随机化 + 独立节流 + 重试 + 全局主机健康管理。"""
+    # 如果新浪主机正在冷却中，直接跳过
+    if _global_host_on_cooldown("finance.sina.com.cn"):
+        remain = _global_host_cooldown_remaining("finance.sina.com.cn")
+        raise RuntimeError(f"sina host on cooldown ({int(remain)}s remaining)")
+
     symbol = _market_prefixed_code(stock_code)
     last_error: Optional[Exception] = None
     for attempt in range(3):
         try:
             _sina_throttle()
-            # 临时 patch requests headers
             import requests
             old_get = requests.get
 
@@ -1284,10 +1338,15 @@ def _fetch_sina_hist_frame(stock_code: str, start_date: str, end_date: str) -> "
                 )
             finally:
                 requests.get = old_get
+
+            _global_mark_host_ok("finance.sina.com.cn")
             return _normalize_history_frame(df)
         except Exception as e:
             last_error = e
             time.sleep(1.5 * (attempt + 1) + _random.uniform(0.3, 1.0))
+
+    # 全部重试失败 → 标记新浪主机进入冷却
+    _global_mark_host_failed("finance.sina.com.cn")
     if last_error is not None:
         raise last_error
     return pd.DataFrame()
@@ -1612,6 +1671,7 @@ def _load_history_store(
 def _save_history_store(stock_code: str, df: pd.DataFrame, keep_rows: int = 0) -> None:
     """保存历史数据到本地 SQLite。
     keep_rows=0 表示保存全部行（企业级策略：不截断，保证任意天数查询都能命中缓存）。
+    保存前会做 OHLC 数据校验，有异常记录到日志但不阻止保存。
     """
     if df is None or df.empty:
         return
@@ -1622,6 +1682,19 @@ def _save_history_store(stock_code: str, df: pd.DataFrame, keep_rows: int = 0) -
     out = out.sort_values("date").reset_index(drop=True)
     if keep_rows > 0:
         out = out.tail(max(keep_rows, 10)).reset_index(drop=True)
+
+    # 数据校验（只记日志不阻止保存）
+    try:
+        from stock_validator import validate_ohlc, validate_change_pct
+        ohlc_issues = validate_ohlc(out, stock_code)
+        pct_issues = validate_change_pct(out, stock_code=stock_code)
+        if ohlc_issues:
+            logger.warning("%s 保存前检测到 %d 条 OHLC 异常", stock_code, len(ohlc_issues))
+        if pct_issues:
+            logger.warning("%s 保存前检测到 %d 条涨跌幅异常", stock_code, len(pct_issues))
+    except Exception:
+        pass
+
     save_history_store(stock_code, out)
 
 
@@ -2118,17 +2191,20 @@ class StockDataFetcher:
                     reason=f"multi-source-eastmoney-{_history_mirror_host(mirror)}",
                 ))
 
-        # 腾讯/新浪：作为补充分流通道（auto 模式或指定模式）
+        # 腾讯/新浪：作为补充分流通道（跳过正在冷却的源）
         if normalized in ("auto", "tencent"):
-            plans.append(HistoryRequestPlan(
-                mode="network",
-                provider_sequence=("tencent",),
-                mirror_urls=(),
-                reason="multi-source-tencent",
-            ))
+            tencent_healthy = _get_healthy_tencent_mirrors()
+            if tencent_healthy:
+                plans.append(HistoryRequestPlan(
+                    mode="network",
+                    provider_sequence=("tencent",),
+                    mirror_urls=(),
+                    reason="multi-source-tencent",
+                ))
         if normalized in ("auto", "sina"):
-            plans.append(HistoryRequestPlan(
-                mode="network",
+            if not _global_host_on_cooldown("finance.sina.com.cn"):
+                plans.append(HistoryRequestPlan(
+                    mode="network",
                 provider_sequence=("sina",),
                 mirror_urls=(),
                 reason="multi-source-sina",
@@ -2756,22 +2832,34 @@ class StockDataFetcher:
                 "summary": "未能解析有效交易日范围",
             }
 
-        result = self.compare_limit_up_pools(trade_dates[-1], trade_dates[-2])
+        # 先批量获取所有日期的涨停池到缓存，避免 compare_limit_up_pools 内部重复请求
+        pool_cache: Dict[str, pd.DataFrame] = {}
+        for td in trade_dates:
+            if td not in pool_cache:
+                pool_cache[td] = self.get_limit_up_pool(td)
+        # 临时 patch get_limit_up_pool 让 compare_limit_up_pools 复用缓存
+        _orig_get_pool = self.get_limit_up_pool
+        self.get_limit_up_pool = lambda date_str: pool_cache.get(  # type: ignore[assignment]
+            self._normalize_trade_date(date_str), _orig_get_pool(date_str)
+        )
+        try:
+            result = self.compare_limit_up_pools(trade_dates[-1], trade_dates[-2])
+        finally:
+            self.get_limit_up_pool = _orig_get_pool  # type: ignore[assignment]
+
         daily_stats: List[Dict[str, Any]] = []
         for trade_date in trade_dates:
-            pool_df = self.get_limit_up_pool(trade_date)
+            pool_df = pool_cache.get(trade_date, pd.DataFrame())
             first_df = pd.DataFrame()
             if not pool_df.empty and "连板数" in pool_df.columns:
                 first_df = pool_df[pool_df["连板数"] == 1].copy()
             industry_top = sorted(self._count_industry(first_df).items(), key=lambda x: -x[1])[:3]
-            daily_stats.append(
-                {
-                    "trade_date": trade_date,
-                    "pool_count": int(len(pool_df)),
-                    "first_count": int(len(first_df)),
-                    "top_industries": industry_top,
-                }
-            )
+            daily_stats.append({
+                "trade_date": trade_date,
+                "pool_count": int(len(pool_df)),
+                "first_count": int(len(first_df)),
+                "top_industries": industry_top,
+            })
 
         first_counts = [item["first_count"] for item in daily_stats]
         avg_first = sum(first_counts) / len(first_counts) if first_counts else 0.0
@@ -3212,10 +3300,52 @@ class StockDataFetcher:
         target_trade_date: str = "",
         include_meta: bool = False,
     ) -> Any:
+        import json as _json
+        from stock_store import load_intraday_cache, save_intraday_cache
+
         code = str(stock_code or "").strip().zfill(6)
         if not code:
             return None if not include_meta else _empty_intraday_meta_payload()
 
+        today_str = _today_ymd()
+
+        # ---- 本地缓存命中：过去交易日的分时数据不会再变 ----
+        requested_date = str(target_trade_date or "").strip()
+        if requested_date and requested_date < today_str:
+            cached = load_intraday_cache(code, requested_date)
+            if cached and cached.get("data_json"):
+                try:
+                    rows = _json.loads(cached["data_json"])
+                    intraday_df = pd.DataFrame(rows)
+                    if not intraday_df.empty and "time" in intraday_df.columns:
+                        intraday_df["time"] = pd.to_datetime(intraday_df["time"], errors="coerce")
+                        for col in ["open", "close", "high", "low", "volume", "amount", "avg_price"]:
+                            if col in intraday_df.columns:
+                                intraday_df[col] = pd.to_numeric(intraday_df[col], errors="coerce")
+                        auction_snapshot = None
+                        auction_raw = cached.get("auction_json", "")
+                        if auction_raw:
+                            try:
+                                auction_snapshot = _json.loads(auction_raw)
+                                if auction_snapshot and "time" in auction_snapshot:
+                                    auction_snapshot["time"] = pd.to_datetime(auction_snapshot["time"], errors="coerce")
+                            except Exception:
+                                auction_snapshot = None
+                        if self._log:
+                            self._log(f"分时 {code} {requested_date} 从本地缓存读取 ({len(intraday_df)} 行)")
+                        if include_meta:
+                            return {
+                                "intraday": intraday_df,
+                                "selected_trade_date": requested_date,
+                                "available_trade_dates": [requested_date],
+                                "applied_day_offset": 0,
+                                "auction": auction_snapshot,
+                            }
+                        return intraday_df
+                except Exception:
+                    pass  # 缓存损坏，回退网络
+
+        # ---- 网络获取 ----
         raw = None
         auction_snapshot = None
         last_error: Optional[Exception] = None
@@ -3277,6 +3407,23 @@ class StockDataFetcher:
             auction_snapshot = None
 
         intraday_df = df[["time", "open", "close", "high", "low", "volume", "amount", "avg_price"]].copy()
+
+        # ---- 缓存过去交易日的分时数据到本地 ----
+        if selected_trade_date and selected_trade_date < today_str and not intraday_df.empty:
+            try:
+                save_df = intraday_df.copy()
+                save_df["time"] = save_df["time"].astype(str)
+                data_json = save_df.to_json(orient="records", force_ascii=False)
+                auction_json = ""
+                if auction_snapshot and isinstance(auction_snapshot, dict):
+                    save_auction = dict(auction_snapshot)
+                    if "time" in save_auction:
+                        save_auction["time"] = str(save_auction["time"])
+                    auction_json = _json.dumps(save_auction, ensure_ascii=False, default=str)
+                save_intraday_cache(code, selected_trade_date, data_json, auction_json, len(intraday_df))
+            except Exception:
+                pass  # 缓存写入失败不影响正常流程
+
         if include_meta:
             payload = _empty_intraday_meta_payload(
                 selected_trade_date=selected_trade_date,

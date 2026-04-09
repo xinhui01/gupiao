@@ -24,13 +24,21 @@ from data_source_models import DATA_SOURCE_OPTIONS
 from stock_filter import StockFilter
 from stock_data import clear_history_data, clear_universe_data
 from stock_store import (
+    backup_database,
+    cleanup_all,
     ensure_store_ready,
+    export_watchlist_csv,
+    import_watchlist_csv,
+    list_backups,
+    load_app_config,
     load_latest_scan_snapshot,
     load_scan_snapshot,
-    save_scan_snapshot,
-    save_watchlist_item,
     load_watchlist,
     load_watchlist_item,
+    restore_database,
+    save_app_config,
+    save_scan_snapshot,
+    save_watchlist_item,
     delete_watchlist_item,
 )
 
@@ -97,10 +105,7 @@ class StockMonitorApp:
         self.result_column_vars: Dict[str, tk.BooleanVar] = {}
         self.result_column_order: List[str] = []
         self.default_result_display_columns: tuple[str, ...] = ()
-        self.result_layout_path = Path("data") / "result_columns.json"
-        self.board_filter_layout_path = Path("data") / "board_filters.json"
-        self.app_settings_path = Path("data") / "app_settings.json"
-        self.limit_up_compare_snapshot_path = Path("data") / "limit_up_compare_snapshot.json"
+        # GUI 设置统一存储在 SQLite app_config 表中（key: result_column_layout / board_filter_layout / app_settings / limit_up_compare_snapshot）
         self._log_queue: "queue.SimpleQueue[str]" = queue.SimpleQueue()
         self._main_thread_id = threading.get_ident()
         self._is_closing = False
@@ -155,6 +160,9 @@ class StockMonitorApp:
         file_menu.add_command(label="导出结果图片", command=self.export_results_image)
         file_menu.add_command(label="复制代码", command=self.copy_selected_stock_code_name, accelerator="Ctrl+C")
         file_menu.add_separator()
+        file_menu.add_command(label="导出自选股 CSV", command=self._export_watchlist_csv)
+        file_menu.add_command(label="导入自选股 CSV", command=self._import_watchlist_csv)
+        file_menu.add_separator()
         file_menu.add_command(label="退出", command=self.on_close)
 
         setting_menu = tk.Menu(menubar, tearoff=0)
@@ -162,6 +170,10 @@ class StockMonitorApp:
         setting_menu.add_command(label="扫描参数", command=self.show_settings)
         setting_menu.add_command(label="清空股票池", command=self.on_clear_universe_data)
         setting_menu.add_command(label="清空历史数据", command=self.on_clear_history_data)
+        setting_menu.add_separator()
+        setting_menu.add_command(label="清理过期数据", command=self._on_cleanup_data)
+        setting_menu.add_command(label="备份数据库", command=self._on_backup_database)
+        setting_menu.add_command(label="恢复数据库", command=self._on_restore_database)
 
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="帮助", menu=help_menu)
@@ -444,25 +456,16 @@ class StockMonitorApp:
         return ("code", "name", "latest_close")
 
     def _save_board_filter_layout(self) -> None:
-        self.board_filter_layout_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "selected": [
-                board
-                for board, var in self.board_filter_vars.items()
-                if var.get()
-            ],
+            "selected": [board for board, var in self.board_filter_vars.items() if var.get()],
         }
-        self.board_filter_layout_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        save_app_config("board_filter_layout", payload)
 
     def _load_board_filter_layout(self) -> None:
-        if not self.board_filter_layout_path.exists() or not self.board_filter_vars:
+        if not self.board_filter_vars:
             return
-        try:
-            payload = json.loads(self.board_filter_layout_path.read_text(encoding="utf-8"))
-        except Exception:
+        payload = load_app_config("board_filter_layout")
+        if not isinstance(payload, dict):
             return
         saved_selected = {
             str(board).strip()
@@ -475,24 +478,17 @@ class StockMonitorApp:
             var.set(board in saved_selected)
 
     def _save_app_settings(self) -> None:
-        self.app_settings_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "history_source": str(self.history_source_var.get() or "auto").strip().lower() or "auto",
             "intraday_source": str(self.intraday_source_var.get() or "auto").strip().lower() or "auto",
             "fund_flow_source": str(self.fund_flow_source_var.get() or "auto").strip().lower() or "auto",
             "limit_up_reason_source": str(self.limit_up_reason_source_var.get() or "auto").strip().lower() or "auto",
         }
-        self.app_settings_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        save_app_config("app_settings", payload)
 
     def _load_app_settings(self) -> None:
-        if not self.app_settings_path.exists():
-            return
-        try:
-            payload = json.loads(self.app_settings_path.read_text(encoding="utf-8"))
-        except Exception:
+        payload = load_app_config("app_settings")
+        if not isinstance(payload, dict):
             return
         source = str(payload.get("history_source") or "auto").strip().lower() or "auto"
         if source in DATA_SOURCE_OPTIONS["history"]:
@@ -516,22 +512,15 @@ class StockMonitorApp:
         self.stock_filter.set_limit_up_reason_source_preference(self.limit_up_reason_source_var.get())
 
     def _save_limit_up_compare_snapshot(self, result: Dict[str, Any]) -> None:
-        self.limit_up_compare_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "result": result,
         }
-        self.limit_up_compare_snapshot_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        save_app_config("limit_up_compare_snapshot", payload)
 
     def _load_last_limit_up_compare(self) -> None:
-        if not self.limit_up_compare_snapshot_path.exists():
-            return
-        try:
-            payload = json.loads(self.limit_up_compare_snapshot_path.read_text(encoding="utf-8"))
-        except Exception:
+        payload = load_app_config("limit_up_compare_snapshot")
+        if not isinstance(payload, dict):
             return
         result = payload.get("result")
         if not isinstance(result, dict):
@@ -547,22 +536,17 @@ class StockMonitorApp:
         self._apply_limit_up_compare(result, persist=False, status_message="已从本地恢复涨停对比")
 
     def _save_result_column_layout(self) -> None:
-        self.result_layout_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "order": list(self.result_column_order or self.result_columns),
             "visible": list(self._visible_result_columns()),
         }
-        self.result_layout_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        save_app_config("result_column_layout", payload)
 
     def _load_result_column_layout(self) -> None:
-        if not self.result_layout_path.exists() or not self.result_columns:
+        if not self.result_columns:
             return
-        try:
-            payload = json.loads(self.result_layout_path.read_text(encoding="utf-8"))
-        except Exception:
+        payload = load_app_config("result_column_layout")
+        if not isinstance(payload, dict):
             return
 
         saved_order = payload.get("order") or []
@@ -874,6 +858,10 @@ class StockMonitorApp:
             ("volume_expand_ratio", "放量倍数"),
             ("big_order_amount", "大单净额"),
             ("main_force_amount", "主力净额"),
+            ("macd", "MACD"),
+            ("kdj", "KDJ"),
+            ("rsi", "RSI"),
+            ("boll", "BOLL"),
             ("summary", "结论"),
         ]
 
@@ -1208,6 +1196,53 @@ class StockMonitorApp:
         self._zt_status_label.config(text="")
         self.status_var.set("涨停对比失败")
 
+    def _infer_board_from_code(self, code: str) -> str:
+        c = str(code).strip().zfill(6)
+        if c.startswith(("300", "301")):
+            return "创业板"
+        if c.startswith("688"):
+            return "科创板"
+        if c.startswith(("000", "001", "002", "003")):
+            return "深交所主板"
+        if c.startswith(("5", "6", "9")):
+            return "上交所主板"
+        return ""
+
+    def _zt_filter_records(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """按当前控制面板的板块和价格筛选涨停分类记录。"""
+        allowed_boards = {str(b).strip() for b in self._selected_boards() if str(b).strip()}
+        try:
+            min_price = float(self.min_price_var.get().strip()) if self.min_price_var.get().strip() else None
+        except ValueError:
+            min_price = None
+        try:
+            max_price = float(self.max_price_var.get().strip()) if self.max_price_var.get().strip() else None
+        except ValueError:
+            max_price = None
+
+        filtered: List[Dict[str, Any]] = []
+        for rec in records:
+            code = str(rec.get("code", "")).strip().zfill(6)
+            board = self._infer_board_from_code(code)
+            if allowed_boards and board not in allowed_boards:
+                continue
+            close = rec.get("close")
+            if close is not None:
+                if min_price is not None and close < min_price:
+                    continue
+                if max_price is not None and close > max_price:
+                    continue
+            filtered.append(rec)
+        return filtered
+
+    def _refresh_zt_compare_display(self):
+        """用当前筛选条件重新渲染涨停对比（不重新拉数据）。"""
+        if self._zt_compare_result is None:
+            return
+        self._apply_limit_up_compare(
+            self._zt_compare_result, persist=False, status_message="涨停对比已按筛选条件更新"
+        )
+
     def _apply_limit_up_compare(
         self,
         result: Dict[str, Any],
@@ -1216,12 +1251,30 @@ class StockMonitorApp:
         status_message: str = "涨停对比完成",
     ):
         self._zt_compare_result = result
-        today_classified = result.get("today_classified", [])
-        yesterday_classified = result.get("yesterday_classified", [])
+        # 应用板块 + 价格过滤
+        today_classified = self._zt_filter_records(result.get("today_classified", []))
+        yesterday_classified = self._zt_filter_records(result.get("yesterday_classified", []))
         compare_days = int(result.get("compare_days", 2) or 2)
         trade_dates = [d for d in result.get("trade_dates", []) if d]
         daily_stats = result.get("daily_stats", []) or []
         ref_label = "昨日" if compare_days <= 2 else "上一交易日"
+
+        # 筛选状态提示
+        total_today = len(result.get("today_classified", []))
+        total_yest = len(result.get("yesterday_classified", []))
+        filter_active = len(today_classified) < total_today or len(yesterday_classified) < total_yest
+        filter_hint = ""
+        if filter_active:
+            boards_text = "/".join(self._selected_boards())
+            parts = [f"板块={boards_text}"]
+            min_p = self.min_price_var.get().strip()
+            max_p = self.max_price_var.get().strip()
+            if min_p or max_p:
+                parts.append(f"价格={min_p or '*'}~{max_p or '*'}")
+            filter_hint = (
+                f"[筛选中: {', '.join(parts)}] "
+                f"今日 {len(today_classified)}/{total_today}，{ref_label} {len(yesterday_classified)}/{total_yest}"
+            )
 
         # ---- 统计形态分布 ----
         pattern_counts_today: Dict[str, int] = {}
@@ -1242,6 +1295,8 @@ class StockMonitorApp:
         txt = self._zt_summary_text
 
         txt.insert(tk.END, result.get("summary", "") + "\n")
+        if filter_hint:
+            txt.insert(tk.END, f"\n{filter_hint}\n")
         if today_burst_count or yest_burst_count:
             txt.insert(tk.END, f"今日暴量涨停: {today_burst_count} 只；{ref_label}暴量涨停: {yest_burst_count} 只\n")
 
@@ -1288,17 +1343,6 @@ class StockMonitorApp:
                 pct = c / max(len(yesterday_classified), 1) * 100
                 bar = "#" * int(pct / 3)
                 txt.insert(tk.END, f"  {p:10s}  {c:3d} 只  {pct:5.1f}%  {bar}\n")
-
-            # 形态变化对比
-            txt.insert(tk.END, f"\n{'='*36}\n")
-            txt.insert(tk.END, f"  形态变化（今日 vs {ref_label}）\n")
-            txt.insert(tk.END, f"{'='*36}\n")
-            for p in all_patterns:
-                t = pattern_counts_today.get(p, 0)
-                y = pattern_counts_yest.get(p, 0)
-                delta = t - y
-                arrow = "+" if delta > 0 else ""
-                txt.insert(tk.END, f"  {p:10s}  {y:2d} → {t:2d}  ({arrow}{delta})\n")
 
         # 行业分布
         ind_today = result.get("industry_today", {})
@@ -1767,28 +1811,31 @@ class StockMonitorApp:
         if self.is_scanning:
             return
         source = self.all_scan_results or self.filtered_stocks
-        if not source:
+        if source:
+            try:
+                self.update_result_table(source, announce=False, persist=False)
+                self.status_var.set(f"已按筛选条件更新，当前显示 {len(self.filtered_stocks)} 只")
+            except ValueError as exc:
+                messagebox.showerror("错误", str(exc))
+        else:
             self.status_var.set("已保存显示板块筛选设置")
-            return
-        try:
-            self.update_result_table(source, announce=False, persist=False)
-            self.status_var.set(f"已按筛选条件更新，当前显示 {len(self.filtered_stocks)} 只")
-        except ValueError as exc:
-            messagebox.showerror("错误", str(exc))
+        # 同步刷新涨停对比
+        self._refresh_zt_compare_display()
 
     def on_price_filter_changed(self, event=None):
         if self.is_scanning:
             return "break" if event is not None else None
         source = self.all_scan_results or self.filtered_stocks
-        if not source:
-            self.status_var.set("当前没有可筛选结果")
-            return "break" if event is not None else None
-        try:
-            self._apply_result_filters(source, raise_price_error=True)
-            self.update_result_table(source, announce=False, persist=False)
-            self.status_var.set(f"已按价格过滤，当前显示 {len(self.filtered_stocks)} 只")
-        except ValueError as exc:
-            messagebox.showerror("错误", str(exc))
+        if source:
+            try:
+                self._apply_result_filters(source, raise_price_error=True)
+                self.update_result_table(source, announce=False, persist=False)
+                self.status_var.set(f"已按价格过滤，当前显示 {len(self.filtered_stocks)} 只")
+            except ValueError as exc:
+                messagebox.showerror("错误", str(exc))
+                return "break" if event is not None else None
+        # 同步刷新涨停对比
+        self._refresh_zt_compare_display()
         return "break" if event is not None else None
 
     def clear_price_filter(self):
@@ -2016,6 +2063,7 @@ class StockMonitorApp:
             error_text = str(e)
             self.root.after(0, lambda: self._log(f"扫描出错: {error_text}"))
             self.root.after(0, lambda: self.scan_finished(f"扫描失败: {error_text}"))
+            self.root.after(0, lambda et=error_text: self._show_network_error_alert(et))
 
     def update_history_cache(self, request: ScanRequest):
         import time as _time
@@ -2139,6 +2187,7 @@ class StockMonitorApp:
             error_text = str(e)
             self.root.after(0, lambda: self._log(f"历史缓存更新出错: {error_text}"))
             self.root.after(0, lambda: self.scan_finished(f"历史缓存更新失败: {error_text}"))
+            self.root.after(0, lambda et=error_text: self._show_network_error_alert(et))
 
     def _sort_value_for_column(self, item: Dict[str, Any], column: str):
         data = item.get("data", {}) or {}
@@ -2727,6 +2776,39 @@ class StockMonitorApp:
         self.detail_labels["limit_up"].config(text="是" if analysis.get("limit_up") else "否")
         self.detail_labels["big_order_amount"].config(text=self._format_amount(analysis.get("big_order_amount")))
         self.detail_labels["main_force_amount"].config(text=self._format_amount(analysis.get("main_force_amount")))
+
+        # 技术指标
+        dif = analysis.get("macd_dif")
+        dea = analysis.get("macd_dea")
+        macd_bar = analysis.get("macd_bar")
+        if dif is not None and dea is not None:
+            self.detail_labels["macd"].config(text=f"DIF {dif:.3f} / DEA {dea:.3f}")
+        else:
+            self.detail_labels["macd"].config(text="-")
+
+        kdj_k = analysis.get("kdj_k")
+        kdj_d = analysis.get("kdj_d")
+        kdj_j = analysis.get("kdj_j")
+        if kdj_k is not None:
+            self.detail_labels["kdj"].config(text=f"K {kdj_k:.1f} / D {kdj_d:.1f} / J {kdj_j:.1f}")
+        else:
+            self.detail_labels["kdj"].config(text="-")
+
+        rsi6 = analysis.get("rsi_6")
+        rsi12 = analysis.get("rsi_12")
+        if rsi6 is not None:
+            self.detail_labels["rsi"].config(text=f"RSI6 {rsi6:.1f} / RSI12 {rsi12:.1f}")
+        else:
+            self.detail_labels["rsi"].config(text="-")
+
+        boll_upper = analysis.get("boll_upper")
+        boll_mid = analysis.get("boll_mid")
+        boll_lower = analysis.get("boll_lower")
+        if boll_mid is not None:
+            self.detail_labels["boll"].config(text=f"U {boll_upper:.2f} / M {boll_mid:.2f} / L {boll_lower:.2f}")
+        else:
+            self.detail_labels["boll"].config(text="-")
+
         self.detail_labels["summary"].config(text=analysis.get("summary", "-"))
         self._update_detail_watch_state(self._current_detail_code)
 
@@ -3957,6 +4039,104 @@ class StockMonitorApp:
     def on_clear_history_data(self):
         clear_history_data()
         self._log("已清空历史数据。")
+
+    # ================= 网络异常醒目提示 =================
+
+    def _show_network_error_alert(self, error_text: str) -> None:
+        """扫描/缓存更新失败时弹出醒目提示。"""
+        if self._is_closing:
+            return
+        network_keywords = ("连接", "超时", "timeout", "connection", "refused", "reset", "网络", "ssl", "proxy", "limited")
+        is_network = any(kw in error_text.lower() for kw in network_keywords)
+        if is_network:
+            messagebox.showerror(
+                "网络异常",
+                f"操作失败，疑似网络问题：\n\n{error_text[:300]}\n\n"
+                "建议：\n"
+                "1. 检查网络连接\n"
+                "2. 尝试切换数据源（设置 -> 扫描参数）\n"
+                "3. 稍后重试",
+            )
+        else:
+            messagebox.showerror("操作失败", error_text[:500])
+
+    # ================= 自选股导入/导出 =================
+
+    def _export_watchlist_csv(self) -> None:
+        file_path = filedialog.asksaveasfilename(
+            title="导出自选股",
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv")],
+            initialfile="watchlist.csv",
+        )
+        if not file_path:
+            return
+        try:
+            count = export_watchlist_csv(file_path)
+            if count > 0:
+                messagebox.showinfo("成功", f"已导出 {count} 只自选股到\n{file_path}")
+            else:
+                messagebox.showwarning("提示", "自选股列表为空，无内容可导出")
+        except Exception as exc:
+            messagebox.showerror("导出失败", str(exc))
+
+    def _import_watchlist_csv(self) -> None:
+        file_path = filedialog.askopenfilename(
+            title="导入自选股",
+            filetypes=[("CSV 文件", "*.csv")],
+        )
+        if not file_path:
+            return
+        try:
+            count = import_watchlist_csv(file_path)
+            messagebox.showinfo("成功", f"已导入 {count} 只自选股")
+            self._load_watchlist_items()
+        except Exception as exc:
+            messagebox.showerror("导入失败", str(exc))
+
+    # ================= 数据清理 =================
+
+    def _on_cleanup_data(self) -> None:
+        result = cleanup_all()
+        total = sum(result.values())
+        detail = (
+            f"历史数据：删除 {result.get('history', 0)} 条\n"
+            f"分时缓存：删除 {result.get('intraday', 0)} 条\n"
+            f"扫描快照：删除 {result.get('scan_snapshots', 0)} 条"
+        )
+        messagebox.showinfo("清理完成", f"共清理 {total} 条过期数据。\n\n{detail}")
+        self._log(f"数据清理完成：{result}")
+
+    # ================= 数据库备份/恢复 =================
+
+    def _on_backup_database(self) -> None:
+        try:
+            path = backup_database()
+            messagebox.showinfo("备份成功", f"数据库已备份到:\n{path}")
+            self._log(f"数据库备份完成：{path}")
+        except Exception as exc:
+            messagebox.showerror("备份失败", str(exc))
+
+    def _on_restore_database(self) -> None:
+        file_path = filedialog.askopenfilename(
+            title="选择备份文件",
+            filetypes=[("SQLite 数据库", "*.sqlite3")],
+            initialdir=str(Path("data") / "backups"),
+        )
+        if not file_path:
+            return
+        confirm = messagebox.askyesno(
+            "确认恢复",
+            f"将从以下文件恢复数据库:\n{file_path}\n\n当前数据库会先自动备份。是否继续？",
+        )
+        if not confirm:
+            return
+        ok = restore_database(file_path)
+        if ok:
+            messagebox.showinfo("恢复成功", "数据库已恢复。建议重启应用以确保数据一致。")
+            self._log(f"数据库恢复完成：{file_path}")
+        else:
+            messagebox.showerror("恢复失败", "恢复过程出错，请检查日志。")
 
     def on_close(self):
         self._is_closing = True

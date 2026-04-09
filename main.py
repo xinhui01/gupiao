@@ -28,13 +28,20 @@ def main():
         os.environ["GUPPIAO_BYPASS_PROXY"] = "1"
     else:
         os.environ.pop("GUPPIAO_BYPASS_PROXY", None)
+
+    from stock_logger import get_logger
+    logger = get_logger(__name__)
+    logger.info("应用启动")
+
     from stock_gui import StockMonitorApp
     from stock_store import ensure_store_ready
 
     ensure_store_ready()
     root = tk.Tk()
     app = StockMonitorApp(root)
+    logger.info("主窗口已初始化，进入主循环")
     root.mainloop()
+    logger.info("应用退出")
 
 
 if __name__ == "__main__":

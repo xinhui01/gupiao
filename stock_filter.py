@@ -12,6 +12,9 @@ import pandas as pd
 
 from scan_models import FilterSettings, HistoryRequestPlan
 from stock_data import StockDataFetcher
+from stock_logger import get_logger
+
+logger = get_logger(__name__)
 from concurrent.futures.thread import _worker, _threads_queues
 
 
@@ -137,6 +140,52 @@ class StockFilter:
         analysis["big_order_ratio"] = None
         analysis["super_big_order_ratio"] = None
         analysis["fund_flow_history"] = []
+
+    def _enrich_analysis_with_indicators(
+        self,
+        analysis: Dict[str, Any],
+        history: Optional[pd.DataFrame],
+    ) -> None:
+        """在 analysis 字典中追加 MACD/KDJ/RSI/BOLL 最新值。"""
+        if history is None or history.empty or "close" not in history.columns:
+            analysis["macd_dif"] = None
+            analysis["macd_dea"] = None
+            analysis["macd_bar"] = None
+            analysis["kdj_k"] = None
+            analysis["kdj_d"] = None
+            analysis["kdj_j"] = None
+            analysis["rsi_6"] = None
+            analysis["rsi_12"] = None
+            analysis["boll_upper"] = None
+            analysis["boll_mid"] = None
+            analysis["boll_lower"] = None
+            return
+        try:
+            from stock_indicators import calc_macd, calc_kdj, calc_rsi, calc_boll
+            close = pd.to_numeric(history["close"], errors="coerce")
+            m = calc_macd(close)
+            analysis["macd_dif"] = round(float(m["dif"].iloc[-1]), 3) if not pd.isna(m["dif"].iloc[-1]) else None
+            analysis["macd_dea"] = round(float(m["dea"].iloc[-1]), 3) if not pd.isna(m["dea"].iloc[-1]) else None
+            analysis["macd_bar"] = round(float(m["macd"].iloc[-1]), 3) if not pd.isna(m["macd"].iloc[-1]) else None
+
+            if all(c in history.columns for c in ("high", "low")):
+                k = calc_kdj(history["high"], history["low"], close)
+                analysis["kdj_k"] = round(float(k["k"].iloc[-1]), 2) if not pd.isna(k["k"].iloc[-1]) else None
+                analysis["kdj_d"] = round(float(k["d"].iloc[-1]), 2) if not pd.isna(k["d"].iloc[-1]) else None
+                analysis["kdj_j"] = round(float(k["j"].iloc[-1]), 2) if not pd.isna(k["j"].iloc[-1]) else None
+            else:
+                analysis["kdj_k"] = analysis["kdj_d"] = analysis["kdj_j"] = None
+
+            r = calc_rsi(close, periods=(6, 12))
+            analysis["rsi_6"] = round(float(r["rsi_6"].iloc[-1]), 2) if not pd.isna(r["rsi_6"].iloc[-1]) else None
+            analysis["rsi_12"] = round(float(r["rsi_12"].iloc[-1]), 2) if not pd.isna(r["rsi_12"].iloc[-1]) else None
+
+            b = calc_boll(close)
+            analysis["boll_upper"] = round(float(b["upper"].iloc[-1]), 2) if not pd.isna(b["upper"].iloc[-1]) else None
+            analysis["boll_mid"] = round(float(b["mid"].iloc[-1]), 2) if not pd.isna(b["mid"].iloc[-1]) else None
+            analysis["boll_lower"] = round(float(b["lower"].iloc[-1]), 2) if not pd.isna(b["lower"].iloc[-1]) else None
+        except Exception as exc:
+            logger.debug("技术指标计算失败: %s", exc)
 
     def _build_stock_detail_payload(
         self,
@@ -1156,21 +1205,44 @@ class StockFilter:
         preloaded_history: Optional[pd.DataFrame] = None,
     ) -> Dict[str, Any]:
         code = str(stock_code).strip().zfill(6)
+        history_days = max(80, self.trend_days + self.limit_up_lookback_days + self.ma_period + 20)
+
+        # ---- 并行获取：历史 / 股票池 / 资金流同时发起 ----
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         history = preloaded_history
-        if history is None:
-            history_days = max(80, self.trend_days + self.limit_up_lookback_days + self.ma_period + 20)
-            history = self._call_with_timeout(
-                lambda: self.fetcher.get_history_data(code, days=history_days),
-                timeout_sec=15.0,
-                fallback=None,
-                task_name=f"详情历史 {code}",
+        universe = None
+        fund_flow_df = None
+
+        tasks = {}
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="detail") as pool:
+            if history is None:
+                tasks["history"] = pool.submit(
+                    self._call_with_timeout,
+                    lambda: self.fetcher.get_history_data(code, days=history_days),
+                    15.0, None, f"详情历史 {code}",
+                )
+            tasks["universe"] = pool.submit(
+                self._call_with_timeout,
+                lambda: self.fetcher.get_all_stocks(),
+                8.0, None, f"详情股票池 {code}",
             )
-        universe = self._call_with_timeout(
-            lambda: self.fetcher.get_all_stocks(),
-            timeout_sec=8.0,
-            fallback=None,
-            task_name=f"详情股票池 {code}",
-        )
+            tasks["fund_flow"] = pool.submit(
+                self._call_with_timeout,
+                lambda: self.fetcher.get_fund_flow_data(code, days=30, force_refresh=False),
+                10.0, None, f"详情资金流 {code}",
+            )
+            for key, fut in tasks.items():
+                try:
+                    result = fut.result()
+                    if key == "history":
+                        history = result
+                    elif key == "universe":
+                        universe = result
+                    elif key == "fund_flow":
+                        fund_flow_df = result
+                except Exception:
+                    pass
+
         stock_identity = self._resolve_stock_identity(universe, code)
         analysis = self.analyze_history(
             history,
@@ -1185,14 +1257,8 @@ class StockFilter:
             stock_code=stock_code,
         )
         self._enrich_analysis_with_history_snapshot(analysis, history)
-
-        fund_flow_df = self._call_with_timeout(
-            lambda: self.fetcher.get_fund_flow_data(code, days=30, force_refresh=False),
-            timeout_sec=10.0,
-            fallback=None,
-            task_name=f"详情资金流 {code}",
-        )
         self._enrich_analysis_with_fund_flow(analysis, fund_flow_df)
+        self._enrich_analysis_with_indicators(analysis, history)
         return self._build_stock_detail_payload(code, stock_identity, history, analysis)
 
     def get_stock_detail_history(self, stock_code: str, days: int) -> Optional[pd.DataFrame]:
@@ -1515,17 +1581,35 @@ class StockFilter:
         target_trade_date: str = "",
     ) -> Dict[str, Any]:
         code = str(stock_code).strip().zfill(6)
-        intraday_payload = self._call_with_timeout(
-            lambda: self.fetcher.get_intraday_data(
-                code,
-                day_offset=day_offset,
-                target_trade_date=target_trade_date,
-                include_meta=True,
-            ),
-            timeout_sec=12.0,
-            fallback={},
-            task_name=f"分时 {code}",
-        )
+
+        # ---- 并行获取：分时数据 + 历史(昨收)同时发起 ----
+        from concurrent.futures import ThreadPoolExecutor
+        intraday_payload = {}
+        history_df = None
+
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="intraday") as pool:
+            fut_intraday = pool.submit(
+                self._call_with_timeout,
+                lambda: self.fetcher.get_intraday_data(
+                    code, day_offset=day_offset,
+                    target_trade_date=target_trade_date, include_meta=True,
+                ),
+                12.0, {}, f"分时 {code}",
+            )
+            fut_history = pool.submit(
+                self._call_with_timeout,
+                lambda: self.fetcher.get_history_data(code, days=20),
+                6.0, None, f"分时昨收 {code}",
+            )
+            try:
+                intraday_payload = fut_intraday.result() or {}
+            except Exception:
+                intraday_payload = {}
+            try:
+                history_df = fut_history.result()
+            except Exception:
+                history_df = None
+
         intraday_df = None
         selected_trade_date = ""
         available_trade_dates: List[str] = []
@@ -1543,13 +1627,6 @@ class StockFilter:
             except (TypeError, ValueError):
                 applied_day_offset = 0
 
-        prev_close = None
-        history_df = self._call_with_timeout(
-            lambda: self.fetcher.get_history_data(code, days=20),
-            timeout_sec=6.0,
-            fallback=None,
-            task_name=f"分时昨收 {code}",
-        )
         prev_close = self._resolve_intraday_prev_close(history_df, selected_trade_date)
         return {
             "code": code,
