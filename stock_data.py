@@ -137,7 +137,7 @@ def _history_request_concurrency() -> int:
         value = int(raw) if raw else 2
     except ValueError:
         value = 2
-    return max(1, min(value, 6))
+    return max(1, min(value, 10))
 
 
 def _history_min_request_interval_sec() -> float:
@@ -1827,6 +1827,262 @@ def _fetch_sohu_hist_frame(stock_code: str, start_date: str, end_date: str) -> "
     return pd.DataFrame()
 
 
+# ---- 同花顺 (THS / 10jqka) 历史日线 ----
+_THS_REQUEST_LOCK = threading.Lock()
+_THS_NEXT_REQUEST_AT = 0.0
+_THS_MIN_INTERVAL = 0.6
+
+
+def _ths_throttle() -> None:
+    global _THS_NEXT_REQUEST_AT
+    while True:
+        with _THS_REQUEST_LOCK:
+            now = time.time()
+            wait = _THS_NEXT_REQUEST_AT - now
+            if wait <= 0:
+                _THS_NEXT_REQUEST_AT = now + _THS_MIN_INTERVAL + _random.uniform(0.1, 0.4)
+                return
+        time.sleep(min(wait, 0.5))
+
+
+def _ths_stock_code(code: str) -> str:
+    """同花顺用 hs_000001 格式。"""
+    c = str(code).strip().zfill(6)
+    return f"hs_{c}"
+
+
+def _fetch_ths_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
+    """同花顺 CDN 历史日线：JSONP 格式，按年请求后合并筛选。"""
+    import requests
+    import json as _json
+
+    host = "d.10jqka.com.cn"
+    if _global_host_on_cooldown(host):
+        remain = _global_host_cooldown_remaining(host)
+        raise RuntimeError(f"ths host on cooldown ({int(remain)}s remaining)")
+
+    ths_code = _ths_stock_code(stock_code)
+    # 确定需要请求的年份范围
+    start_year = int(start_date[:4])
+    end_year = int(end_date[:4])
+    years = list(range(start_year, end_year + 1))
+
+    all_rows = []
+    last_error = None
+    for year in years:
+        for attempt in range(2):
+            try:
+                _ths_throttle()
+                url = f"https://{host}/v6/line/{ths_code}/01/{year}.js"
+                resp = requests.get(
+                    url,
+                    timeout=(5, 12),
+                    verify=False,
+                    headers={
+                        "User-Agent": _random.choice(_USER_AGENT_POOL),
+                        "Referer": "https://www.10jqka.com.cn/",
+                    },
+                )
+                if resp.status_code != 200:
+                    last_error = RuntimeError(f"ths HTTP {resp.status_code}")
+                    time.sleep(0.5 + _random.uniform(0.3, 0.8))
+                    continue
+
+                text = resp.text
+                lp = text.find("(")
+                rp = text.rfind(")")
+                if lp < 0 or rp <= lp:
+                    last_error = RuntimeError("ths: invalid JSONP response")
+                    continue
+                data = _json.loads(text[lp + 1 : rp])
+                raw = data.get("data", "")
+                if not raw:
+                    last_error = RuntimeError("ths: empty data field")
+                    continue
+
+                # 格式: date,open,high,low,close,volume,amount,turnover_rate,,,flag;...
+                for line in raw.split(";"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split(",")
+                    if len(parts) < 7:
+                        continue
+                    all_rows.append({
+                        "date": parts[0],
+                        "open": parts[1],
+                        "high": parts[2],
+                        "low": parts[3],
+                        "close": parts[4],
+                        "volume": parts[5],
+                        "amount": parts[6],
+                        "turnover_rate": parts[7] if len(parts) > 7 and parts[7] else None,
+                    })
+                break  # 成功，跳出 retry 循环
+            except Exception as e:
+                last_error = e
+                time.sleep(1.0 + _random.uniform(0.3, 0.8))
+
+    if not all_rows:
+        _global_mark_host_failed(host)
+        if last_error is not None:
+            raise last_error
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    for col in ("open", "close", "high", "low", "volume", "amount", "turnover_rate"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", errors="coerce").dt.date.astype(str)
+    df = df.dropna(subset=["date", "close"])
+    df = df[df["close"] > 0]
+
+    # 按日期范围筛选
+    sd = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}"
+    ed = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}"
+    df = df[(df["date"] >= sd) & (df["date"] <= ed)]
+
+    _global_mark_host_ok(host)
+    return _normalize_history_frame(df)
+
+
+# ---- 华尔街见闻 (WallstreetCN) 历史日线 ----
+_WSCN_REQUEST_LOCK = threading.Lock()
+_WSCN_NEXT_REQUEST_AT = 0.0
+_WSCN_MIN_INTERVAL = 0.5
+
+
+def _wscn_throttle() -> None:
+    global _WSCN_NEXT_REQUEST_AT
+    while True:
+        with _WSCN_REQUEST_LOCK:
+            now = time.time()
+            wait = _WSCN_NEXT_REQUEST_AT - now
+            if wait <= 0:
+                _WSCN_NEXT_REQUEST_AT = now + _WSCN_MIN_INTERVAL + _random.uniform(0.1, 0.4)
+                return
+        time.sleep(min(wait, 0.5))
+
+
+def _wscn_stock_code(code: str) -> str:
+    """华尔街见闻用 000001.SZ / 600000.SS 格式。"""
+    c = str(code).strip().zfill(6)
+    market = "SS" if c.startswith(("5", "6", "9")) else "SZ"
+    return f"{c}.{market}"
+
+
+def _fetch_wscn_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
+    """华尔街见闻历史日线 API：JSON 格式，国际 CDN 节点。"""
+    import requests
+    from datetime import datetime as _dt
+
+    host = "api-ddc-wscn.awtmt.com"
+    if _global_host_on_cooldown(host):
+        remain = _global_host_cooldown_remaining(host)
+        raise RuntimeError(f"wscn host on cooldown ({int(remain)}s remaining)")
+
+    wscn_code = _wscn_stock_code(stock_code)
+    # 计算需要的交易日数（粗略估算，日历天 * 0.7 + buffer）
+    sd = start_date.replace("-", "")
+    ed = end_date.replace("-", "")
+    try:
+        d1 = _dt.strptime(sd[:8], "%Y%m%d")
+        d2 = _dt.strptime(ed[:8], "%Y%m%d")
+        cal_days = (d2 - d1).days
+    except Exception:
+        cal_days = 120
+    tick_count = max(30, int(cal_days * 0.75) + 10)
+
+    url = f"https://{host}/market/kline"
+    params = {
+        "prod_code": wscn_code,
+        "tick_count": str(tick_count),
+        "period_type": "86400",
+        "fields": "tick_at,open_px,close_px,high_px,low_px,turnover_volume,turnover_value",
+    }
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            _wscn_throttle()
+            resp = requests.get(
+                url,
+                params=params,
+                timeout=(5, 12),
+                verify=False,
+                headers={
+                    "User-Agent": _random.choice(_USER_AGENT_POOL),
+                    "Referer": "https://wallstreetcn.com/",
+                    "Origin": "https://wallstreetcn.com",
+                },
+            )
+            if resp.status_code != 200:
+                last_error = RuntimeError(f"wscn HTTP {resp.status_code}")
+                time.sleep(1.0 + _random.uniform(0.5, 1.0))
+                continue
+
+            data = resp.json()
+            if data.get("code") != 20000:
+                last_error = RuntimeError(f"wscn API error: {data.get('message', 'unknown')}")
+                continue
+
+            candle = data.get("data", {}).get("candle", {})
+            stock_data = candle.get(wscn_code, {})
+            lines = stock_data.get("lines", [])
+            if not lines:
+                last_error = RuntimeError("wscn: no kline data")
+                continue
+
+            # fields order: open_px, close_px, high_px, low_px, turnover_volume, turnover_value, tick_at
+            rows = []
+            for line in lines:
+                if len(line) < 7:
+                    continue
+                ts = line[6]  # tick_at is the last field
+                try:
+                    dt = _dt.fromtimestamp(ts)
+                    date_str = dt.strftime("%Y-%m-%d")
+                except Exception:
+                    continue
+                rows.append({
+                    "date": date_str,
+                    "open": line[0],
+                    "close": line[1],
+                    "high": line[2],
+                    "low": line[3],
+                    "volume": line[4],
+                    "amount": line[5],
+                })
+
+            if not rows:
+                last_error = RuntimeError("wscn: empty parsed result")
+                continue
+
+            df = pd.DataFrame(rows)
+            for col in ("open", "close", "high", "low", "volume", "amount"):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date.astype(str)
+            df = df.dropna(subset=["date", "close"])
+            df = df[df["close"] > 0]
+
+            # 按日期范围筛选
+            sd_fmt = f"{sd[:4]}-{sd[4:6]}-{sd[6:8]}"
+            ed_fmt = f"{ed[:4]}-{ed[4:6]}-{ed[6:8]}"
+            df = df[(df["date"] >= sd_fmt) & (df["date"] <= ed_fmt)]
+
+            _global_mark_host_ok(host)
+            return _normalize_history_frame(df)
+        except Exception as e:
+            last_error = e
+            time.sleep(1.5 * (attempt + 1) + _random.uniform(0.3, 1.0))
+
+    _global_mark_host_failed(host)
+    if last_error is not None:
+        raise last_error
+    return pd.DataFrame()
+
+
 def _probe_history_mirror(url: str) -> Tuple[bool, str]:
     probe_code = "000001"
     end_date = datetime.now().strftime("%Y%m%d")
@@ -2708,6 +2964,22 @@ class StockDataFetcher:
                     mirror_urls=(),
                     reason="multi-source-sohu",
                 ))
+        if normalized in ("auto", "ths"):
+            if not _global_host_on_cooldown("d.10jqka.com.cn"):
+                plans.append(HistoryRequestPlan(
+                    mode="network",
+                    provider_sequence=("ths",),
+                    mirror_urls=(),
+                    reason="multi-source-ths",
+                ))
+        if normalized in ("auto", "wscn"):
+            if not _global_host_on_cooldown("api-ddc-wscn.awtmt.com"):
+                plans.append(HistoryRequestPlan(
+                    mode="network",
+                    provider_sequence=("wscn",),
+                    mirror_urls=(),
+                    reason="multi-source-wscn",
+                ))
 
         # 兜底：至少保证一个 auto plan
         if not plans:
@@ -2757,7 +3029,7 @@ class StockDataFetcher:
             min(int(workers or self.history_request_concurrency_limit()), self.history_request_concurrency_limit()),
         )
         if plan_count > 1:
-            worker_count = max(worker_count, min(plan_count + 1, 6))
+            worker_count = max(worker_count, min(plan_count + 1, 10))
 
         updated = 0
         failed = 0
@@ -2867,6 +3139,20 @@ class StockDataFetcher:
                 mirror_urls=(),
                 reason="history-provider=sohu",
             )
+        if normalized == "ths":
+            return HistoryRequestPlan(
+                mode="network",
+                provider_sequence=("ths",),
+                mirror_urls=(),
+                reason="history-provider=ths",
+            )
+        if normalized == "wscn":
+            return HistoryRequestPlan(
+                mode="network",
+                provider_sequence=("wscn",),
+                mirror_urls=(),
+                reason="history-provider=wscn",
+            )
 
         mirrors = tuple(self.get_available_history_mirrors(force_refresh=force_refresh))
         if normalized == "eastmoney":
@@ -2893,7 +3179,7 @@ class StockDataFetcher:
         if mirrors:
             return HistoryRequestPlan(
                 mode="network",
-                provider_sequence=("eastmoney", "tencent", "sina", "netease", "baidu", "sohu"),
+                provider_sequence=("eastmoney", "tencent", "sina", "netease", "baidu", "sohu", "ths", "wscn"),
                 mirror_urls=mirrors,
                 reason="history-provider=auto",
             )
@@ -2905,7 +3191,7 @@ class StockDataFetcher:
             reason = "history-mirrors-unavailable"
         return HistoryRequestPlan(
             mode="network",
-            provider_sequence=("tencent", "sina", "netease", "baidu", "sohu"),
+            provider_sequence=("tencent", "sina", "netease", "baidu", "sohu", "ths", "wscn"),
             mirror_urls=(),
             reason=reason,
         )
@@ -3799,6 +4085,26 @@ class StockDataFetcher:
                         last_error = e
                         if self._log:
                             self._log(f"历史 {stock_code} 使用搜狐源失败: {e}")
+                        continue
+                elif provider == "ths":
+                    try:
+                        if self._log:
+                            self._log(f"历史 {stock_code} 正在使用同花顺源补位。")
+                        df = _fetch_ths_hist_frame(stock_code, start_date, end_date)
+                    except Exception as e:
+                        last_error = e
+                        if self._log:
+                            self._log(f"历史 {stock_code} 使用同花顺源失败: {e}")
+                        continue
+                elif provider == "wscn":
+                    try:
+                        if self._log:
+                            self._log(f"历史 {stock_code} 正在使用华尔街见闻源补位。")
+                        df = _fetch_wscn_hist_frame(stock_code, start_date, end_date)
+                    except Exception as e:
+                        last_error = e
+                        if self._log:
+                            self._log(f"历史 {stock_code} 使用华尔街见闻源失败: {e}")
                         continue
                 else:
                     last_error = RuntimeError(f"unsupported-history-provider: {provider}")
