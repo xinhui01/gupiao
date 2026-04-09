@@ -143,10 +143,10 @@ def _history_request_concurrency() -> int:
 def _history_min_request_interval_sec() -> float:
     raw = os.environ.get("GUPPIAO_HISTORY_MIN_INTERVAL_SEC", "").strip()
     try:
-        value = float(raw) if raw else 1.2
+        value = float(raw) if raw else 2.5
     except ValueError:
-        value = 1.2
-    return max(0.0, min(value, 10.0))
+        value = 2.5
+    return max(0.5, min(value, 15.0))
 
 
 def _history_connect_timeout_sec() -> float:
@@ -239,32 +239,35 @@ _HISTORY_NEXT_REQUEST_AT = 0.0
 _ADAPTIVE_INTERVAL_LOCK = threading.Lock()
 _ADAPTIVE_INTERVAL_SEC = _history_min_request_interval_sec()  # 当前自适应间隔
 _ADAPTIVE_SUCCESS_STREAK = 0  # 连续成功计数
-_ADAPTIVE_MIN_INTERVAL = 0.3   # 自适应下限（秒）
-_ADAPTIVE_MAX_INTERVAL = 8.0   # 自适应上限（秒）
+_ADAPTIVE_MIN_INTERVAL = 1.0   # 自适应下限（秒）—— 太低容易触发封禁
+_ADAPTIVE_MAX_INTERVAL = 15.0  # 自适应上限（秒）
+_ADAPTIVE_RATE_LIMIT_COUNT = 0  # 限流累计次数（用于渐进式惩罚）
 
 
 def _adaptive_on_success() -> None:
-    """网络请求成功后调用，逐步缩短间隔。"""
+    """网络请求成功后调用，逐步缩短间隔（保守策略）。"""
     global _ADAPTIVE_INTERVAL_SEC, _ADAPTIVE_SUCCESS_STREAK
     with _ADAPTIVE_INTERVAL_LOCK:
         _ADAPTIVE_SUCCESS_STREAK += 1
-        # 每连续成功 10 次，间隔缩短 10%
-        if _ADAPTIVE_SUCCESS_STREAK % 10 == 0:
+        # 每连续成功 20 次才缩短 5%，比之前更保守
+        if _ADAPTIVE_SUCCESS_STREAK % 20 == 0:
             _ADAPTIVE_INTERVAL_SEC = max(
                 _ADAPTIVE_MIN_INTERVAL,
-                _ADAPTIVE_INTERVAL_SEC * 0.9,
+                _ADAPTIVE_INTERVAL_SEC * 0.95,
             )
 
 
 def _adaptive_on_rate_limit() -> None:
-    """遇到限流时调用，立即放大间隔。"""
-    global _ADAPTIVE_INTERVAL_SEC, _ADAPTIVE_SUCCESS_STREAK
+    """遇到限流时调用，渐进式惩罚——每次限流惩罚更重。"""
+    global _ADAPTIVE_INTERVAL_SEC, _ADAPTIVE_SUCCESS_STREAK, _ADAPTIVE_RATE_LIMIT_COUNT
     with _ADAPTIVE_INTERVAL_LOCK:
         _ADAPTIVE_SUCCESS_STREAK = 0
-        # 间隔翻倍（但不超过上限）
+        _ADAPTIVE_RATE_LIMIT_COUNT += 1
+        # 首次限流：间隔翻倍；后续每次额外加 50%
+        multiplier = 2.0 + (_ADAPTIVE_RATE_LIMIT_COUNT - 1) * 0.5
         _ADAPTIVE_INTERVAL_SEC = min(
             _ADAPTIVE_MAX_INTERVAL,
-            _ADAPTIVE_INTERVAL_SEC * 2.0,
+            _ADAPTIVE_INTERVAL_SEC * multiplier,
         )
 
 
@@ -424,15 +427,73 @@ _REFERER_POOL = [
 
 
 def _random_eastmoney_headers() -> Dict[str, str]:
-    """每次请求生成随机化的请求头，降低指纹识别风险。"""
-    return {
+    """每次请求生成随机化的请求头，模拟真实浏览器行为。"""
+    # 随机 Accept-Encoding 组合，避免指纹固定
+    accept_encodings = [
+        "gzip, deflate, br",
+        "gzip, deflate",
+        "gzip, deflate, br, zstd",
+    ]
+    # sec-ch-ua 浏览器版本指纹，与 UA 池匹配
+    sec_ch_ua_pool = [
+        '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        '"Chromium";v="124", "Not(A:Brand";v="24", "Google Chrome";v="124"',
+        '"Chromium";v="126", "Not(A:Brand";v="8", "Google Chrome";v="126"',
+        '"Not)A;Brand";v="99", "Microsoft Edge";v="122", "Chromium";v="122"',
+    ]
+    headers = {
         "User-Agent": _random.choice(_USER_AGENT_POOL),
         "Referer": _random.choice(_REFERER_POOL),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": _random.choice(["zh-CN,zh;q=0.9", "zh-CN,zh;q=0.9,en;q=0.8", "zh-CN,zh;q=0.8,en;q=0.6"]),
-        "Accept-Encoding": "gzip, deflate",
-        "Connection": "close",
+        "Accept": _random.choice([
+            "application/json, text/plain, */*",
+            "*/*",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        ]),
+        "Accept-Language": _random.choice([
+            "zh-CN,zh;q=0.9",
+            "zh-CN,zh;q=0.9,en;q=0.8",
+            "zh-CN,zh;q=0.8,en;q=0.6",
+            "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        ]),
+        "Accept-Encoding": _random.choice(accept_encodings),
+        "Connection": _random.choice(["keep-alive", "close"]),
+        "sec-ch-ua": _random.choice(sec_ch_ua_pool),
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": _random.choice(['"Windows"', '"macOS"']),
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
     }
+    # 随机 50% 概率加 DNT / Pragma 头，增加多样性
+    if _random.random() < 0.5:
+        headers["DNT"] = "1"
+    if _random.random() < 0.3:
+        headers["Pragma"] = "no-cache"
+        headers["Cache-Control"] = "no-cache"
+    # 模拟真实浏览器 cookie（东方财富依赖这些 cookie 判断是否为人类访问）
+    headers["Cookie"] = _random_eastmoney_cookie()
+    return headers
+
+
+def _random_eastmoney_cookie() -> str:
+    """生成伪随机的东方财富 cookie，模拟正常浏览器访问痕迹。"""
+    # qgqp_b_id: 设备指纹，32位十六进制
+    qgqp = "".join(_random.choices("0123456789abcdef", k=32))
+    # em_hq_fls: 访问标记
+    em_hq = "js"
+    # st_pvi / st_sp / st_inirUrl / st_sn: 站点统计字段
+    st_pvi = str(_random.randint(10000000000, 99999999999))
+    st_si = f"{int(time.time() * 1000)}-{_random.randint(100000, 999999)}"
+    parts = [
+        f"qgqp_b_id={qgqp}",
+        f"em_hq_fls={em_hq}",
+        f"st_pvi={st_pvi}",
+        f"st_si={st_si}",
+    ]
+    # 随机添加可选字段
+    if _random.random() < 0.6:
+        parts.append(f"HAList=a-sz-{_random.randint(1, 300):06d}")
+    return "; ".join(parts)
 
 
 # 兼容旧引用
@@ -626,9 +687,17 @@ def _history_retry_ak_call(fn: Callable[..., T], *args, **kwargs) -> T:
         return fn(*args, **kwargs)
 
 
+def _random_jsonp_callback() -> str:
+    """生成随机 JSONP 回调名，模拟东方财富网页的真实调用模式。"""
+    ts = int(time.time() * 1000)
+    rand = _random.randint(1000000, 9999999)
+    prefix = _random.choice(["jQuery", "jQuery1124", "jQuery35", "jQuery36"])
+    return f"{prefix}{rand}_{ts}"
+
+
 def _eastmoney_history_request_params(stock_code: str, start_date: str, end_date: str) -> Dict[str, str]:
     market_code = 1 if str(stock_code).startswith("6") else 0
-    return {
+    params = {
         "fields1": "f1,f2,f3,f4,f5,f6",
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
         "ut": "7eea3edcaed734bea9cbfc24409ed989",
@@ -637,11 +706,33 @@ def _eastmoney_history_request_params(stock_code: str, start_date: str, end_date
         "secid": f"{market_code}.{stock_code}",
         "beg": start_date,
         "end": end_date,
+        "cb": _random_jsonp_callback(),
+        "_": str(int(time.time() * 1000)),
     }
+    return params
+
+
+def _strip_jsonp_wrapper(text: str) -> str:
+    """剥离 JSONP 回调包装，提取内部 JSON。
+
+    例如 'jQuery123456_1234567890({...})' → '{...}'
+    """
+    s = text.strip()
+    if not s:
+        return s
+    # 查找第一个 '(' 和最后一个 ')'
+    lp = s.find("(")
+    rp = s.rfind(")")
+    if lp >= 0 and rp > lp:
+        inner = s[lp + 1 : rp].strip()
+        if inner:
+            return inner
+    return s
 
 
 def _request_session_get_json(url: str, params: Dict[str, Any], timeout: Tuple[int, int]) -> Dict[str, Any]:
     import requests
+    import json as _json
 
     _wait_for_history_request_slot()
     _increment_history_diagnostic("network_requests")
@@ -653,7 +744,7 @@ def _request_session_get_json(url: str, params: Dict[str, Any], timeout: Tuple[i
         elif _use_bypass_proxy():
             session.trust_env = False
             session.proxies = {"http": None, "https": None}
-        # 每次请求使用随机化请求头，降低被识别为机器人的风险
+        # 每次请求使用随机化请求头，模拟真实浏览器行为
         req_kw: Dict[str, Any] = {
             "url": url,
             "params": params,
@@ -678,17 +769,24 @@ def _request_session_get_json(url: str, params: Dict[str, Any], timeout: Tuple[i
             )
             raise EastmoneyRateLimitError(message)
         response.raise_for_status()
+
+        # 处理 JSONP 包装：东方财富接口返回 callback({json}) 格式
+        raw_text = _strip_jsonp_wrapper(response_text)
         try:
-            data_json = response.json()
-        except ValueError as exc:
-            if _looks_like_eastmoney_rate_limit(response.status_code, response_text):
-                _adaptive_on_rate_limit()
-                _increment_history_diagnostic("rate_limit_events")
+            data_json = _json.loads(raw_text)
+        except ValueError:
+            # 回退：尝试直接 response.json()
+            try:
+                data_json = response.json()
+            except ValueError as exc:
+                if _looks_like_eastmoney_rate_limit(response.status_code, response_text):
+                    _adaptive_on_rate_limit()
+                    _increment_history_diagnostic("rate_limit_events")
+                    _increment_history_diagnostic("network_failures")
+                    message = _record_history_block("东方财富返回非 JSON 内容，疑似触发限流或封禁")
+                    raise EastmoneyRateLimitError(message) from exc
                 _increment_history_diagnostic("network_failures")
-                message = _record_history_block("东方财富返回非 JSON 内容，疑似触发限流或封禁")
-                raise EastmoneyRateLimitError(message) from exc
-            _increment_history_diagnostic("network_failures")
-            raise
+                raise
         if _eastmoney_json_indicates_rate_limit(data_json):
             _adaptive_on_rate_limit()
             _increment_history_diagnostic("rate_limit_events")
@@ -995,6 +1093,9 @@ def _record_history_block(reason: str) -> str:
 def _wait_for_history_request_slot() -> None:
     # 使用自适应间隔：连续成功则加速，遇到限流则减速
     min_interval = _adaptive_current_interval()
+    # 加随机抖动 ±30%，避免请求间隔过于规律被识别为机器行为
+    jitter = min_interval * _random.uniform(-0.3, 0.3)
+    actual_interval = max(0.5, min_interval + jitter)
     while True:
         blocked_until = _history_access_blocked_until()
         now = time.time()
@@ -1008,7 +1109,7 @@ def _wait_for_history_request_slot() -> None:
             global _HISTORY_NEXT_REQUEST_AT
             wait_sec = _HISTORY_NEXT_REQUEST_AT - now
             if wait_sec <= 0:
-                _HISTORY_NEXT_REQUEST_AT = now + min_interval
+                _HISTORY_NEXT_REQUEST_AT = now + actual_interval
                 return
         time.sleep(min(wait_sec, 0.5))
 
