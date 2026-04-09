@@ -337,6 +337,7 @@ class StockMonitorApp:
         self.setup_detail_tab()
         self.setup_intraday_tab()
         self.setup_limit_up_compare_tab()
+        self.setup_predict_tab()
         self.setup_watchlist_tab()
         self.setup_log_tab()
 
@@ -1421,6 +1422,281 @@ class StockMonitorApp:
         self.status_var.set(status_message)
         if persist:
             self._save_limit_up_compare_snapshot(result)
+
+    # ================= 涨停预测 Tab =================
+    def setup_predict_tab(self):
+        predict_frame = ttk.Frame(self.notebook, padding="5")
+        self.notebook.add(predict_frame, text="涨停预测")
+
+        style = ttk.Style()
+        style.configure("Predict.Treeview", rowheight=24)
+        style.map(
+            "Predict.Treeview",
+            background=[("selected", "#2f6fd6")],
+            foreground=[("selected", "#ffffff")],
+        )
+
+        # ---- 操作栏 ----
+        action_bar = ttk.Frame(predict_frame)
+        action_bar.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(action_bar, text="开始预测", command=self._start_predict).pack(side=tk.LEFT)
+        ttk.Label(action_bar, text="基准日期:").pack(side=tk.LEFT, padx=(12, 2))
+        self._predict_date_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
+        ttk.Entry(action_bar, textvariable=self._predict_date_var, width=10).pack(side=tk.LEFT)
+        ttk.Label(action_bar, text="(基于该日数据预测次日涨停候选)").pack(side=tk.LEFT, padx=6)
+        self._predict_status_label = ttk.Label(action_bar, text="")
+        self._predict_status_label.pack(side=tk.RIGHT, padx=8)
+
+        # ---- 主区域：左侧摘要 + 右侧表格 ----
+        body = ttk.PanedWindow(predict_frame, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # 左侧：摘要面板
+        summary_frame = ttk.LabelFrame(body, text="预测摘要", padding="6")
+        self._predict_summary_text = scrolledtext.ScrolledText(summary_frame, width=42, height=30, wrap=tk.WORD)
+        self._predict_summary_text.pack(fill=tk.BOTH, expand=True)
+        self._predict_summary_text.insert(tk.END,
+            "点击「开始预测」分析明日涨停候选\n\n"
+            "预测维度:\n"
+            "  1. 连板延续: 今日涨停股明日继续封板概率\n"
+            "     - 连板数、封板时间、炸板次数\n"
+            "     - 板块热度、均线排列、量能\n\n"
+            "  2. 首板候选: 今日强势股明日冲击涨停\n"
+            "     - 涨幅接近涨停(5%~9.5%)\n"
+            "     - 缩量蓄势后放量、MACD金叉\n"
+            "     - 均线多头、低位突破\n"
+            "     - 板块联动效应\n\n"
+            "说明: 预测仅供参考，请结合盘面综合判断")
+        self._predict_summary_text.config(state=tk.DISABLED)
+        body.add(summary_frame, weight=2)
+
+        # 右侧：表格区
+        table_frame = ttk.Frame(body)
+        self._predict_table_nb = ttk.Notebook(table_frame)
+        self._predict_table_nb.pack(fill=tk.BOTH, expand=True)
+
+        # 连板延续候选 Tab
+        cont_tab = ttk.Frame(self._predict_table_nb)
+        self._predict_table_nb.add(cont_tab, text="连板延续候选")
+        cont_cols = ("code", "name", "industry", "boards", "change_pct", "close",
+                     "seal_time", "breaks", "turnover", "score", "reasons")
+        self._predict_cont_tree = ttk.Treeview(
+            cont_tab, columns=cont_cols, show="headings", height=22, style="Predict.Treeview",
+        )
+        for col, (heading, w) in {
+            "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
+            "boards": ("连板数", 60), "change_pct": ("涨跌幅%", 70), "close": ("收盘价", 70),
+            "seal_time": ("首封时间", 80), "breaks": ("炸板", 50),
+            "turnover": ("换手%", 65), "score": ("预测分", 65),
+            "reasons": ("预测依据", 300),
+        }.items():
+            self._predict_cont_tree.heading(col, text=heading)
+            self._predict_cont_tree.column(col, width=w, anchor=tk.CENTER if col != "reasons" else tk.W)
+        sb_cont = ttk.Scrollbar(cont_tab, orient=tk.VERTICAL, command=self._predict_cont_tree.yview)
+        self._predict_cont_tree.configure(yscrollcommand=sb_cont.set)
+        sb_cont.pack(side=tk.RIGHT, fill=tk.Y)
+        self._predict_cont_tree.pack(fill=tk.BOTH, expand=True)
+        self._predict_cont_tree.bind("<<TreeviewSelect>>", self._on_predict_stock_select)
+        self._predict_cont_tree.bind("<Double-1>", self._on_predict_stock_double_click)
+        # 行标签色：按分数段
+        self._predict_cont_tree.tag_configure("score_high", background="#c8e6c9", foreground="#1f1f1f")
+        self._predict_cont_tree.tag_configure("score_mid", background="#fff9c4", foreground="#1f1f1f")
+        self._predict_cont_tree.tag_configure("score_low", background="#ffecb3", foreground="#1f1f1f")
+
+        # 首板候选 Tab
+        first_tab = ttk.Frame(self._predict_table_nb)
+        self._predict_table_nb.add(first_tab, text="首板候选")
+        first_cols = ("code", "name", "industry", "change_pct", "close",
+                      "vol_ratio", "pos_60d", "trend_10d", "turnover", "score", "reasons")
+        self._predict_first_tree = ttk.Treeview(
+            first_tab, columns=first_cols, show="headings", height=22, style="Predict.Treeview",
+        )
+        for col, (heading, w) in {
+            "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
+            "change_pct": ("今日涨幅%", 75), "close": ("收盘价", 70),
+            "vol_ratio": ("量比", 60), "pos_60d": ("60日分位%", 75),
+            "trend_10d": ("10日涨幅%", 75), "turnover": ("换手%", 65),
+            "score": ("预测分", 65), "reasons": ("预测依据", 300),
+        }.items():
+            self._predict_first_tree.heading(col, text=heading)
+            self._predict_first_tree.column(col, width=w, anchor=tk.CENTER if col != "reasons" else tk.W)
+        sb_first = ttk.Scrollbar(first_tab, orient=tk.VERTICAL, command=self._predict_first_tree.yview)
+        self._predict_first_tree.configure(yscrollcommand=sb_first.set)
+        sb_first.pack(side=tk.RIGHT, fill=tk.Y)
+        self._predict_first_tree.pack(fill=tk.BOTH, expand=True)
+        self._predict_first_tree.bind("<<TreeviewSelect>>", self._on_predict_stock_select)
+        self._predict_first_tree.bind("<Double-1>", self._on_predict_stock_double_click)
+        self._predict_first_tree.tag_configure("score_high", background="#c8e6c9", foreground="#1f1f1f")
+        self._predict_first_tree.tag_configure("score_mid", background="#fff9c4", foreground="#1f1f1f")
+        self._predict_first_tree.tag_configure("score_low", background="#ffecb3", foreground="#1f1f1f")
+
+        body.add(table_frame, weight=4)
+
+        self._predict_thread: Optional[threading.Thread] = None
+        self._predict_result: Optional[Dict[str, Any]] = None
+
+    def _score_tag(self, score: int) -> str:
+        if score >= 70:
+            return "score_high"
+        elif score >= 50:
+            return "score_mid"
+        return "score_low"
+
+    def _start_predict(self):
+        if self._predict_thread is not None and self._predict_thread.is_alive():
+            return
+        trade_date = self._predict_date_var.get().strip()
+        if not trade_date:
+            trade_date = datetime.now().strftime("%Y%m%d")
+            self._predict_date_var.set(trade_date)
+
+        self._predict_summary_text.config(state=tk.NORMAL)
+        self._predict_summary_text.delete("1.0", tk.END)
+        self._predict_summary_text.insert(tk.END, f"正在基于 {trade_date} 数据预测明日涨停候选...\n")
+        self._predict_summary_text.config(state=tk.DISABLED)
+        self._predict_status_label.config(text="正在获取数据...")
+        self.status_var.set("正在执行涨停预测...")
+
+        self._predict_thread = threading.Thread(
+            target=self._load_predict, args=(trade_date,), daemon=True
+        )
+        self._predict_thread.start()
+
+    def _load_predict(self, trade_date: str):
+        try:
+            def _progress(cur, tot, info):
+                self.root.after(0, lambda c=cur, t=tot, i=info:
+                    self._predict_status_label.config(text=f"预测分析 {c}/{t}: {i}"))
+
+            result = self.stock_filter.predict_limit_up_candidates(
+                trade_date, progress_callback=_progress,
+            )
+            self.root.after(0, lambda r=result: self._apply_predict_result(r))
+        except Exception as e:
+            err = str(e)
+            self.root.after(0, lambda: self._predict_show_error(f"涨停预测失败: {err}"))
+
+    def _predict_show_error(self, msg: str):
+        self._predict_summary_text.config(state=tk.NORMAL)
+        self._predict_summary_text.delete("1.0", tk.END)
+        self._predict_summary_text.insert(tk.END, msg)
+        self._predict_summary_text.config(state=tk.DISABLED)
+        self._predict_status_label.config(text="")
+        self.status_var.set("涨停预测失败")
+
+    def _apply_predict_result(self, result: Dict[str, Any]):
+        self._predict_result = result
+        cont_list = result.get("continuation_candidates", [])
+        first_list = result.get("first_board_candidates", [])
+        hot_industries = result.get("hot_industries", {})
+
+        # ---- 填充摘要 ----
+        self._predict_summary_text.config(state=tk.NORMAL)
+        self._predict_summary_text.delete("1.0", tk.END)
+        txt = self._predict_summary_text
+
+        txt.insert(tk.END, result.get("summary", "") + "\n")
+
+        # 连板延续分数分布
+        if cont_list:
+            txt.insert(tk.END, f"\n{'='*36}\n")
+            txt.insert(tk.END, f"  连板延续候选 TOP10\n")
+            txt.insert(tk.END, f"{'='*36}\n")
+            for rec in cont_list[:10]:
+                boards_text = f"{rec['consecutive_boards']}板" if rec.get("consecutive_boards", 1) > 1 else "首板"
+                txt.insert(tk.END,
+                    f"  {rec['code']} {rec.get('name', ''):6s}  {boards_text:4s}  "
+                    f"分={rec['score']:3d}  {rec.get('reasons', '')}\n")
+
+        if first_list:
+            txt.insert(tk.END, f"\n{'='*36}\n")
+            txt.insert(tk.END, f"  首板候选 TOP10\n")
+            txt.insert(tk.END, f"{'='*36}\n")
+            for rec in first_list[:10]:
+                chg = rec.get("change_pct")
+                chg_text = f"{chg:.1f}%" if chg is not None else "-"
+                txt.insert(tk.END,
+                    f"  {rec['code']} {rec.get('name', ''):6s}  涨{chg_text:6s}  "
+                    f"分={rec['score']:3d}  {rec.get('reasons', '')}\n")
+
+        # 热门行业
+        if hot_industries:
+            txt.insert(tk.END, f"\n{'='*36}\n")
+            txt.insert(tk.END, f"  今日涨停行业分布\n")
+            txt.insert(tk.END, f"{'='*36}\n")
+            for k, v in sorted(hot_industries.items(), key=lambda x: -x[1])[:10]:
+                bar = "#" * v
+                txt.insert(tk.END, f"  {k:10s}  {v:2d} 只  {bar}\n")
+
+        txt.insert(tk.END, f"\n{'='*36}\n")
+        txt.insert(tk.END, "说明：预测得分仅供参考，请结合次日\n"
+                           "竞价、盘口、板块情绪综合判断。\n"
+                           "高分不代表必涨停，低分也可能超预期。\n")
+        self._predict_summary_text.config(state=tk.DISABLED)
+
+        # ---- 填充连板延续表格 ----
+        self._predict_cont_tree.delete(*self._predict_cont_tree.get_children())
+        for rec in cont_list:
+            tag = self._score_tag(rec.get("score", 0))
+            vals = (
+                rec.get("code", ""),
+                rec.get("name", ""),
+                rec.get("industry", ""),
+                str(rec.get("consecutive_boards", 1)),
+                f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
+                f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
+                rec.get("first_board_time", "-"),
+                str(rec.get("break_count", 0)),
+                f"{rec['turnover']:.1f}" if rec.get("turnover") is not None else "-",
+                str(rec.get("score", 0)),
+                rec.get("reasons", ""),
+            )
+            self._predict_cont_tree.insert("", tk.END, values=vals, tags=(tag,))
+
+        # ---- 填充首板候选表格 ----
+        self._predict_first_tree.delete(*self._predict_first_tree.get_children())
+        for rec in first_list:
+            tag = self._score_tag(rec.get("score", 0))
+            vals = (
+                rec.get("code", ""),
+                rec.get("name", ""),
+                rec.get("industry", ""),
+                f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
+                f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
+                f"{rec['vol_ratio']:.2f}" if rec.get("vol_ratio") is not None else "-",
+                f"{rec['position_60d']:.0f}" if rec.get("position_60d") is not None else "-",
+                f"{rec['trend_10d']:.1f}" if rec.get("trend_10d") is not None else "-",
+                f"{rec['turnover']:.1f}" if rec.get("turnover") is not None else "-",
+                str(rec.get("score", 0)),
+                rec.get("reasons", ""),
+            )
+            self._predict_first_tree.insert("", tk.END, values=vals, tags=(tag,))
+
+        # 更新Tab标题显示数量
+        self._predict_table_nb.tab(0, text=f"连板延续候选({len(cont_list)})")
+        self._predict_table_nb.tab(1, text=f"首板候选({len(first_list)})")
+
+        self._predict_status_label.config(text="")
+        self.status_var.set(f"涨停预测完成: 连板延续{len(cont_list)}只 / 首板候选{len(first_list)}只")
+
+    def _on_predict_stock_select(self, event):
+        tree = event.widget
+        sel = tree.selection()
+        if not sel:
+            return
+        vals = tree.item(sel[0], "values")
+        if vals:
+            code = str(vals[0]).strip().zfill(6)
+            self.status_var.set(f"预测候选: {code} {vals[1] if len(vals) > 1 else ''}")
+
+    def _on_predict_stock_double_click(self, event):
+        tree = event.widget
+        stock_code = self._get_tree_selected_code(tree)
+        if not stock_code:
+            return
+        self._cancel_scheduled_detail()
+        self.show_stock_detail(stock_code, force_refresh=True)
+        self.notebook.select(self.detail_tab_frame)
 
     def setup_watchlist_tab(self):
         watch_frame = ttk.Frame(self.notebook, padding="5")
