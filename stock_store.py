@@ -19,6 +19,10 @@ logger = get_logger(__name__)
 _DATA_DIR = Path(__file__).resolve().parent / "data"
 _DB_PATH = _DATA_DIR / "stock_store.sqlite3"
 _DB_WRITE_LOCK = threading.RLock()
+_SCHEMA_INITIALIZED = False
+_SCHEMA_INITIALIZED_PATH = ""
+_SCHEMA_LOCK = threading.Lock()
+_THREAD_LOCAL = threading.local()
 
 
 def _ensure_dir() -> None:
@@ -27,12 +31,33 @@ def _ensure_dir() -> None:
 
 def _connect() -> sqlite3.Connection:
     _ensure_dir()
+    # 线程本地连接复用：同一线程内复用连接，避免每次操作都创建新连接
+    conn = getattr(_THREAD_LOCAL, "conn", None)
+    conn_path = getattr(_THREAD_LOCAL, "conn_path", None)
+    if conn is not None and conn_path == str(_DB_PATH):
+        try:
+            conn.execute("SELECT 1")
+            return conn
+        except (sqlite3.ProgrammingError, sqlite3.OperationalError):
+            _THREAD_LOCAL.conn = None
+    db_path_str = str(_DB_PATH)
     conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=30000;")
-    _init_schema(conn)
+    global _SCHEMA_INITIALIZED, _SCHEMA_INITIALIZED_PATH
+    need_schema = False
+    if not _SCHEMA_INITIALIZED or _SCHEMA_INITIALIZED_PATH != db_path_str:
+        with _SCHEMA_LOCK:
+            if not _SCHEMA_INITIALIZED or _SCHEMA_INITIALIZED_PATH != db_path_str:
+                need_schema = True
+                _SCHEMA_INITIALIZED = True
+                _SCHEMA_INITIALIZED_PATH = db_path_str
+    if need_schema:
+        _init_schema(conn)
+    _THREAD_LOCAL.conn = conn
+    _THREAD_LOCAL.conn_path = db_path_str
     return conn
 
 
@@ -824,7 +849,14 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
+_ALLOWED_CLEAR_TABLES = frozenset({
+    "universe", "history", "fund_flow", "history_meta", "scan_snapshots",
+    "intraday_cache", "limit_up_pool", "watchlist", "app_config",
+})
+
 def _clear_table(table_name: str) -> None:
+    if table_name not in _ALLOWED_CLEAR_TABLES:
+        raise ValueError(f"不允许清空的表: {table_name}")
     with _connect() as conn:
         conn.execute(f"DELETE FROM {table_name}")
 
@@ -1044,13 +1076,14 @@ def save_limit_up_pool(trade_date: str, df: pd.DataFrame, pool_type: str = "toda
     data_json = df.to_json(orient="records", force_ascii=False)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     def _do():
-        with _DB_WRITE_LOCK, _connect() as conn:
+        with _connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO limit_up_pool (trade_date, pool_type, data_json, row_count, saved_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (date_key, pool_type, data_json, len(df), now),
             )
-    _retry_locked(_do)
+    with _DB_WRITE_LOCK:
+        _retry_locked(_do)
 
 
 def load_limit_up_pool(trade_date: str, pool_type: str = "today") -> Optional[pd.DataFrame]:

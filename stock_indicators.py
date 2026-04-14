@@ -64,7 +64,7 @@ def calc_kdj(
     lowest_low = low.rolling(window=n, min_periods=1).min()
     highest_high = high.rolling(window=n, min_periods=1).max()
 
-    rsv = (close - lowest_low) / (highest_high - lowest_low).replace(0, np.nan) * 100
+    rsv = ((close - lowest_low) / (highest_high - lowest_low).replace(0, np.nan)) * 100
     rsv = rsv.fillna(50)
 
     k = pd.Series(np.nan, index=close.index, dtype=float)
@@ -73,8 +73,8 @@ def calc_kdj(
     k.iloc[0] = 50.0
     d.iloc[0] = 50.0
     for i in range(1, len(rsv)):
-        k.iloc[i] = (2.0 / m1) * k.iloc[i - 1] + (1.0 / m1) * rsv.iloc[i]
-        d.iloc[i] = (2.0 / m2) * d.iloc[i - 1] + (1.0 / m2) * k.iloc[i]
+        k.iloc[i] = ((m1 - 1.0) / m1) * k.iloc[i - 1] + (1.0 / m1) * rsv.iloc[i]
+        d.iloc[i] = ((m2 - 1.0) / m2) * d.iloc[i - 1] + (1.0 / m2) * k.iloc[i]
 
     j = 3 * k - 2 * d
     return {"k": k, "d": d, "j": j}

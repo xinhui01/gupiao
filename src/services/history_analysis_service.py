@@ -219,8 +219,9 @@ class HistoryAnalysisService:
             change_pct = pd.to_numeric(df["change_pct"], errors="coerce")
             result["latest_change_pct"] = self._coerce_float(change_pct.iloc[-1]) if not change_pct.empty else None
 
-        if len(df) >= self.config.trend_days and not pd.isna(close.iloc[-1]) and not pd.isna(close.iloc[-self.config.trend_days]):
-            prev_close = close.iloc[-self.config.trend_days]
+        _five_day_lookback = 5
+        if len(df) >= _five_day_lookback and not pd.isna(close.iloc[-1]) and not pd.isna(close.iloc[-_five_day_lookback]):
+            prev_close = close.iloc[-_five_day_lookback]
             if not pd.isna(prev_close) and float(prev_close) != 0.0:
                 result["five_day_return"] = (float(close.iloc[-1]) / float(prev_close) - 1.0) * 100.0
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import os
 import time
 import re
@@ -70,6 +71,10 @@ def _apply_network_patches() -> None:
                     except (TypeError, ValueError):
                         pass
                 kwargs["headers"] = merged
+            elif "sina.com.cn" in u or "sinajs.cn" in u:
+                kwargs.setdefault("headers", {})
+                kwargs["headers"]["User-Agent"] = _random.choice(_USER_AGENT_POOL)
+                kwargs["headers"]["Referer"] = "https://finance.sina.com.cn/"
             return _orig_req(self, method, url, **kwargs)
 
         requests.Session.__init__ = _patched_init  # type: ignore[method-assign]
@@ -650,25 +655,6 @@ def _history_diagnostics_snapshot() -> Dict[str, int]:
         return {str(k): int(v) for k, v in _HISTORY_DIAGNOSTICS.items()}
 
 
-def _project_root() -> Path:
-    return Path(__file__).resolve().parent
-
-
-def _use_insecure_ssl() -> bool:
-    if os.environ.get("GUPPIAO_INSECURE_SSL", "").strip().lower() in ("1", "true", "yes"):
-        return True
-    root = _project_root()
-    return (root / "USE_INSECURE_SSL").is_file() or (root / ".gupiao_insecure_ssl").is_file()
-
-
-def _use_bypass_proxy() -> bool:
-    """不走 HTTP(S)_PROXY 等环境代理（避免公司代理对东方财富断开）。"""
-    if os.environ.get("GUPPIAO_BYPASS_PROXY", "").strip().lower() in ("1", "true", "yes"):
-        return True
-    root = _project_root()
-    return (root / "USE_BYPASS_PROXY").is_file() or (root / ".gupiao_bypass_proxy").is_file()
-
-
 def _is_transient_network_error(exc: BaseException) -> bool:
     if isinstance(exc, (RequestsConnectionError, RequestsTimeout, OSError)):
         return True
@@ -691,12 +677,12 @@ def _is_name_resolution_error(exc: BaseException) -> bool:
     )
 
 
-def _retry_ak_call(fn: Callable[..., T], *args, retries: int = 2, base_delay: float = 1.0, **kwargs) -> T:
-    for attempt in range(retries):
+def _retry_ak_call(fn: Callable[..., T], *args, max_attempts: int = 2, base_delay: float = 1.0, **kwargs) -> T:
+    for attempt in range(max_attempts):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
-            if attempt < retries - 1 and _is_transient_network_error(e):
+            if attempt < max_attempts - 1 and _is_transient_network_error(e):
                 time.sleep(base_delay * (attempt + 1))
                 continue
             raise
@@ -1331,7 +1317,7 @@ def _fetch_tencent_hist_direct(
     for year in range(range_start, range_end):
         params = {
             "_var": f"kline_day{year}",
-            "param": f"{symbol},day,{year}-01-01,{year + 1}-12-31,640,",
+            "param": f"{symbol},day,{year}-01-01,{year}-12-31,640,",
             "r": f"0.{_random.randint(1000000000, 9999999999)}",
         }
         last_error = None
@@ -1441,26 +1427,13 @@ def _fetch_sina_hist_frame(stock_code: str, start_date: str, end_date: str) -> "
     for attempt in range(3):
         try:
             _sina_throttle()
-            import requests
-            old_get = requests.get
-
-            def _patched_get(url, **kwargs):
-                if "sina.com.cn" in str(url) or "sinajs.cn" in str(url):
-                    kwargs.setdefault("headers", {})
-                    kwargs["headers"]["User-Agent"] = _random.choice(_USER_AGENT_POOL)
-                    kwargs["headers"]["Referer"] = "https://finance.sina.com.cn/"
-                return old_get(url, **kwargs)
-
-            requests.get = _patched_get
-            try:
-                df = ak.stock_zh_a_daily(
-                    symbol=symbol,
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust="",
-                )
-            finally:
-                requests.get = old_get
+            # sina 请求头已在 _apply_network_patches 的 Session.request 补丁中统一处理
+            df = ak.stock_zh_a_daily(
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                adjust="",
+            )
 
             _global_mark_host_ok("finance.sina.com.cn")
             return _normalize_history_frame(df)
@@ -2198,62 +2171,6 @@ def _fetch_eastmoney_hist_frame(
     return pd.DataFrame()
 
 
-# 须在 import akshare 之前执行：统一为 requests 补头；可选 SSL / 忽略环境代理
-def _apply_network_patches() -> None:
-    need_ssl = _use_insecure_ssl()
-    need_no_proxy = _use_bypass_proxy()
-
-    if need_ssl:
-        import ssl
-
-        ssl._create_default_https_context = ssl._create_unverified_context
-
-        try:
-            import urllib3
-
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        except ImportError:
-            pass
-
-    try:
-        import requests
-
-        _orig_init = requests.Session.__init__
-        _orig_req = requests.Session.request
-
-        def _patched_init(self, *args, **kwargs):
-            _orig_init(self, *args, **kwargs)
-            if need_no_proxy:
-                self.trust_env = False
-
-        def _patched_request(self, method, url, **kwargs):
-            if need_ssl:
-                kwargs.setdefault("verify", False)
-            u = str(url)
-            if "eastmoney.com" in u:
-                merged = _random_eastmoney_headers()
-                merged.setdefault("Connection", "close")
-                extra = kwargs.get("headers")
-                if isinstance(extra, dict):
-                    merged.update(extra)
-                elif extra is not None:
-                    try:
-                        merged.update(dict(extra))
-                    except (TypeError, ValueError):
-                        pass
-                kwargs["headers"] = merged
-            return _orig_req(self, method, url, **kwargs)
-
-        requests.Session.__init__ = _patched_init  # type: ignore[method-assign]
-        requests.Session.request = _patched_request  # type: ignore[method-assign]
-    except ImportError:
-        pass
-
-
-_apply_network_patches()
-
-import akshare as ak
-import pandas as pd
 try:
     from pandas.errors import SettingWithCopyWarning as _AkshareWarningCategory
 except ImportError:
@@ -2573,7 +2490,7 @@ def _gupiao_request_with_retry(
                     adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1)
                     session.mount("http://", adapter)
                     session.mount("https://", adapter)
-                    hdrs = dict(_EASTMONEY_HEADERS)
+                    hdrs = _random_eastmoney_headers()
                     req_kw: Dict[str, Any] = {
                         "url": base_url,
                         "params": params,
@@ -2641,11 +2558,13 @@ def _em_scalar(x: Any) -> float:
 
 
 def _em_price_yuan(x: Any) -> float:
-    """东财 stock/get 行情价字段多为整数，常见为「元×1000」。"""
+    """东财 stock/get 行情价字段多为整数，常见为「元×1000」。
+    阈值用 10000 以避免误伤高价股（如贵州茅台 ~1500 元）。
+    """
     v = _em_scalar(x)
     if v == 0.0:
         return 0.0
-    if abs(v) >= 500:
+    if abs(v) >= 10000:
         return v / 1000.0
     return v
 
@@ -2660,14 +2579,10 @@ def _norm_code_series(s: pd.Series) -> pd.Series:
 
 
 def _norm_code(code: Any) -> str:
-    return (
-        str(code)
-        .replace(".0", "")
-        .strip()
-        .zfill(6)
-        if str(code).strip() and str(code).strip().lower() != "nan"
-        else ""
-    )
+    s = str(code).strip()
+    if not s or s.lower() == "nan":
+        return ""
+    return re.sub(r"\.0$", "", s).strip().zfill(6)
 
 
 def _infer_sz_board(code: str) -> str:
@@ -2870,12 +2785,31 @@ def _build_a_share_universe(log: Optional[Callable[[str], None]] = None) -> pd.D
 
 
 
+class _LRUCache(collections.OrderedDict):
+    """简单的 LRU 缓存，超出 maxsize 时自动淘汰最旧条目。"""
+    def __init__(self, maxsize: int = 30, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._maxsize = maxsize
+
+    def __setitem__(self, key, value):
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        while len(self) > self._maxsize:
+            self.popitem(last=False)
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+
 class StockDataFetcher:
     def __init__(self):
         self._log: Optional[Callable[[str], None]] = None
-        self._strong_pool_cache: Dict[str, pd.DataFrame] = {}
-        self._limit_up_pool_cache: Dict[str, pd.DataFrame] = {}
-        self._prev_limit_up_pool_cache: Dict[str, pd.DataFrame] = {}
+        self._strong_pool_cache: Dict[str, pd.DataFrame] = _LRUCache(maxsize=30)
+        self._limit_up_pool_cache: Dict[str, pd.DataFrame] = _LRUCache(maxsize=30)
+        self._prev_limit_up_pool_cache: Dict[str, pd.DataFrame] = _LRUCache(maxsize=30)
         self._concepts_cache: Optional[Dict[str, str]] = None
         self._universe_concepts_cache: Optional[Dict[str, str]] = None
         self._history_mirror_cache: List[str] = []

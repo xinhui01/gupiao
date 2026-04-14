@@ -231,14 +231,6 @@ class StockMonitorApp:
             variable=self.refresh_universe_var,
         ).pack(side=tk.LEFT, padx=15)
 
-    def _build_control_scan_params_note_row(self, control_frame) -> None:
-        row1_note = ttk.Frame(control_frame)
-        row1_note.pack(fill=tk.X, pady=2)
-        ttk.Label(
-            row1_note,
-            text="备注：放量倍数=最近N天成交量最大值/最小值，勾选“启用放量倍数”后才参与筛选。",
-        ).pack(side=tk.LEFT, padx=5)
-
     def _build_control_actions_row(self, control_frame) -> None:
         row2 = ttk.Frame(control_frame)
         row2.pack(fill=tk.X, pady=5)
@@ -4477,6 +4469,9 @@ class StockMonitorApp:
         self._intraday_loading_code = ""
         self._cancel_scheduled_detail()
         self._close_run_log()
+        for t in (self._scan_thread, self._cache_thread):
+            if t is not None and t.is_alive():
+                t.join(timeout=3.0)
         try:
             self.root.quit()
             self.root.destroy()

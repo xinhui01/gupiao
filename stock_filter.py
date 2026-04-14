@@ -6,45 +6,16 @@ import time
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, TimeoutError as FutureTimeoutError
 from typing import List, Dict, Any, Optional, Callable, Tuple
 import threading
-import weakref
 
 import pandas as pd
 
 from scan_models import FilterSettings, HistoryRequestPlan
 from src.models.analysis_models import HistoryAnalysisConfig
 from src.services.history_analysis_service import HistoryAnalysisService
-from stock_data import StockDataFetcher
+from stock_data import StockDataFetcher, DaemonThreadPoolExecutor
 from stock_logger import get_logger
 
 logger = get_logger(__name__)
-from concurrent.futures.thread import _worker, _threads_queues
-
-
-class DaemonThreadPoolExecutor(ThreadPoolExecutor):
-    def _adjust_thread_count(self):
-        if self._idle_semaphore.acquire(timeout=0):
-            return
-
-        def weakref_cb(_, q=self._work_queue):
-            q.put(None)
-
-        num_threads = len(self._threads)
-        if num_threads < self._max_workers:
-            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            t = threading.Thread(
-                name=thread_name,
-                target=_worker,
-                args=(
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,
-                    self._initializer,
-                    self._initargs,
-                ),
-                daemon=True,
-            )
-            t.start()
-            self._threads.add(t)
-            _threads_queues[t] = self._work_queue
 
 
 class StockFilter:
@@ -225,6 +196,19 @@ class StockFilter:
         self.volume_expand_factor = max(1.0, float(settings.volume_expand_factor))
         self.require_limit_up_within_days = bool(settings.require_limit_up_within_days)
 
+    _timeout_pool: Optional[ThreadPoolExecutor] = None
+    _timeout_pool_lock = threading.Lock()
+
+    @classmethod
+    def _get_timeout_pool(cls) -> ThreadPoolExecutor:
+        if cls._timeout_pool is None:
+            with cls._timeout_pool_lock:
+                if cls._timeout_pool is None:
+                    cls._timeout_pool = DaemonThreadPoolExecutor(
+                        max_workers=4, thread_name_prefix="timeout"
+                    )
+        return cls._timeout_pool
+
     def _call_with_timeout(
         self,
         task: Callable[[], Any],
@@ -232,28 +216,19 @@ class StockFilter:
         fallback: Any = None,
         task_name: str = "任务",
     ) -> Any:
-        result: Dict[str, Any] = {}
-        error: Dict[str, Exception] = {}
-        done = threading.Event()
-
-        def _runner() -> None:
-            try:
-                result["value"] = task()
-            except Exception as exc:
-                error["err"] = exc
-            finally:
-                done.set()
-
-        threading.Thread(target=_runner, daemon=True).start()
-        if not done.wait(timeout=max(0.5, float(timeout_sec))):
+        pool = self._get_timeout_pool()
+        future = pool.submit(task)
+        try:
+            return future.result(timeout=max(0.5, float(timeout_sec)))
+        except FutureTimeoutError:
+            future.cancel()
             if self._log:
                 self._log(f"{task_name} 超时（>{timeout_sec:.0f}s），已跳过。")
             return fallback
-        if "err" in error:
+        except Exception as exc:
             if self._log:
-                self._log(f"{task_name} 失败: {error['err']}")
+                self._log(f"{task_name} 失败: {exc}")
             return fallback
-        return result.get("value", fallback)
 
     def check_close_above_ma(
         self, history_data: pd.DataFrame, streak_days: int, ma_period: int
@@ -974,8 +949,8 @@ class StockFilter:
                         universe = result
                     elif key == "fund_flow":
                         fund_flow_df = result
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("预取数据 %s 异常: %s", key, exc)
 
         stock_identity = self._resolve_stock_identity(universe, code)
         analysis = self.analyze_history(
@@ -1247,8 +1222,8 @@ class StockFilter:
             nonlocal completed
             try:
                 self.fetcher.get_history_data(code, days=days, force_refresh=False)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("预取历史 %s 失败: %s", code, exc)
             finally:
                 with completed_lock:
                     completed += 1
@@ -1267,8 +1242,8 @@ class StockFilter:
             for fut in as_completed(futures):
                 try:
                     fut.result(timeout=15.0)  # 单只股票最多15秒
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("预取 future 异常: %s", exc)
         finally:
             executor.shutdown(wait=True)  # 等待所有任务完成，不取消
 
@@ -1369,11 +1344,13 @@ class StockFilter:
             )
             try:
                 intraday_payload = fut_intraday.result() or {}
-            except Exception:
+            except Exception as exc:
+                logger.debug("分时数据获取失败 %s: %s", code, exc)
                 intraday_payload = {}
             try:
                 history_df = fut_history.result()
-            except Exception:
+            except Exception as exc:
+                logger.debug("历史数据获取失败 %s: %s", code, exc)
                 history_df = None
 
         intraday_df = None
@@ -1625,7 +1602,8 @@ class StockFilter:
                         force_refresh=False,
                         request_plan=local_cache_plan,
                     )
-                except Exception:
+                except Exception as exc:
+                    logger.debug("涨停分类获取历史 %s 失败: %s", code, exc)
                     history = None
 
                 if history is None or history.empty or len(history) < 10:
@@ -2021,7 +1999,8 @@ class StockFilter:
                 code, days=65, force_refresh=False,
                 request_plan=self._build_local_cache_history_plan(reason="predict-continuation-cache-only"),
             )
-        except Exception:
+        except Exception as exc:
+            logger.debug("预测续板获取历史 %s 失败: %s", code, exc)
             history = None
         if history is not None and not history.empty and len(history) >= 10:
             df = history.sort_values("date").reset_index(drop=True)
@@ -2222,7 +2201,8 @@ class StockFilter:
                 code, days=65, force_refresh=False,
                 request_plan=self._build_local_cache_history_plan(reason="predict-first-board-cache-only"),
             )
-        except Exception:
+        except Exception as exc:
+            logger.debug("预测首板获取历史 %s 失败: %s", code, exc)
             history = None
 
         industry = ""

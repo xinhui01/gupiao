@@ -33,31 +33,46 @@ def validate_ohlc(df: pd.DataFrame, stock_code: str = "") -> List[Dict[str, Any]
     if not required.issubset(set(df.columns)):
         return issues
 
-    for idx, row in df.iterrows():
-        date_str = str(row.get("date", idx))
-        o, c, h, l = row.get("open"), row.get("close"), row.get("high"), row.get("low")
-        try:
-            o, c, h, l = float(o), float(c), float(h), float(l)
-        except (TypeError, ValueError):
-            issues.append({"date": date_str, "issue": "非数值", "detail": f"O={o} C={c} H={h} L={l}"})
-            continue
+    o = pd.to_numeric(df["open"], errors="coerce")
+    c = pd.to_numeric(df["close"], errors="coerce")
+    h = pd.to_numeric(df["high"], errors="coerce")
+    l = pd.to_numeric(df["low"], errors="coerce")
+    dates = df["date"].astype(str) if "date" in df.columns else df.index.astype(str)
 
-        # 非正价格
-        if any(v <= 0 for v in (o, c, h, l)):
-            issues.append({"date": date_str, "issue": "价格<=0", "detail": f"O={o} C={c} H={h} L={l}"})
-            continue
+    # 非数值
+    nan_mask = o.isna() | c.isna() | h.isna() | l.isna()
+    for idx in nan_mask[nan_mask].index:
+        issues.append({"date": str(dates[idx]), "issue": "非数值",
+                        "detail": f"O={df.at[idx, 'open']} C={df.at[idx, 'close']} H={df.at[idx, 'high']} L={df.at[idx, 'low']}"})
 
-        # High 不是最高
-        if h < max(o, c) - 0.005:
-            issues.append({"date": date_str, "issue": "high < max(open, close)", "detail": f"H={h} O={o} C={c}"})
+    valid = ~nan_mask
+    # 非正价格
+    neg_mask = valid & ((o <= 0) | (c <= 0) | (h <= 0) | (l <= 0))
+    for idx in neg_mask[neg_mask].index:
+        issues.append({"date": str(dates[idx]), "issue": "价格<=0",
+                        "detail": f"O={o[idx]} C={c[idx]} H={h[idx]} L={l[idx]}"})
 
-        # Low 不是最低
-        if l > min(o, c) + 0.005:
-            issues.append({"date": date_str, "issue": "low > min(open, close)", "detail": f"L={l} O={o} C={c}"})
+    check = valid & ~neg_mask
+    oc_max = pd.concat([o, c], axis=1).max(axis=1)
+    oc_min = pd.concat([o, c], axis=1).min(axis=1)
 
-        # High < Low
-        if h < l - 0.005:
-            issues.append({"date": date_str, "issue": "high < low", "detail": f"H={h} L={l}"})
+    # High 不是最高
+    high_bad = check & (h < oc_max - 0.005)
+    for idx in high_bad[high_bad].index:
+        issues.append({"date": str(dates[idx]), "issue": "high < max(open, close)",
+                        "detail": f"H={h[idx]} O={o[idx]} C={c[idx]}"})
+
+    # Low 不是最低
+    low_bad = check & (l > oc_min + 0.005)
+    for idx in low_bad[low_bad].index:
+        issues.append({"date": str(dates[idx]), "issue": "low > min(open, close)",
+                        "detail": f"L={l[idx]} O={o[idx]} C={c[idx]}"})
+
+    # High < Low
+    hl_bad = check & (h < l - 0.005)
+    for idx in hl_bad[hl_bad].index:
+        issues.append({"date": str(dates[idx]), "issue": "high < low",
+                        "detail": f"H={h[idx]} L={l[idx]}"})
 
     if issues and stock_code:
         logger.warning("%s 存在 %d 条 OHLC 异常", stock_code, len(issues))
