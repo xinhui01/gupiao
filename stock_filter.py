@@ -1766,15 +1766,17 @@ class StockFilter:
                     self._log(f"涨停预测：获取涨停池失败 (get_limit_up_pool): {e}")
 
             try:
-                # 全市场行情最多 15 秒
-                future_spot.result(timeout=15.0)
+                # 全市场行情：东财约5秒，新浪约30秒
+                from stock_data import _eastmoney_circuit_breaker_open
+                _spot_timeout = 45.0 if _eastmoney_circuit_breaker_open() else 20.0
+                future_spot.result(timeout=_spot_timeout)
             except FutureTimeoutError as e:
                 if self._log:
-                    self._log(f"涨停预测：获取全市场行情超时 (ak.stock_zh_a_spot_em, 5000+只股票): {e}")
+                    self._log(f"涨停预测：获取全市场行情超时 (5000+只股票): {e}")
                     self._log("涨停预测：将跳过首板候选筛选，继续执行连板延续分析")
             except Exception as e:
                 if self._log:
-                    self._log(f"涨停预测：获取全市场行情失败 (ak.stock_zh_a_spot_em): {e}")
+                    self._log(f"涨停预测：获取全市场行情失败: {e}")
                     self._log("涨停预测：将跳过首板候选筛选，继续执行连板延续分析")
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
@@ -2096,17 +2098,34 @@ class StockFilter:
         return candidates[:50]
 
     def _fetch_spot_snapshot(self) -> Optional[pd.DataFrame]:
-        """获取全市场实时行情快照（只调一次 API）。"""
+        """获取全市场实时行情快照（只调一次 API）。
+        优先东财，东财熔断时自动回退到新浪。
+        """
+        import akshare as ak
+        from stock_data import _retry_ak_call, _eastmoney_circuit_breaker_open
+        # 东财可用时优先东财
+        if not _eastmoney_circuit_breaker_open():
+            try:
+                if self._log:
+                    self._log("涨停预测：正在获取全市场实时行情快照（东财）...")
+                return _retry_ak_call(ak.stock_zh_a_spot_em)
+            except Exception as e:
+                if self._log:
+                    self._log(f"涨停预测：东财实时行情失败: {e}，尝试新浪备选...")
+        # 新浪备选
         try:
-            import akshare as ak
-            from stock_data import _retry_ak_call
             if self._log:
-                self._log("涨停预测：正在调用 ak.stock_zh_a_spot_em() 获取全市场实时行情快照（5000+只股票）...")
-            return _retry_ak_call(ak.stock_zh_a_spot_em)
-        except Exception as e:
+                self._log("涨停预测：正在获取全市场实时行情快照（新浪，约30s）...")
+            df = _retry_ak_call(ak.stock_zh_a_spot)
+            if df is not None and not df.empty:
+                # 新浪代码带交易所前缀（如 sh600000），去掉前缀统一为纯数字
+                if "代码" in df.columns:
+                    df["代码"] = df["代码"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True).str.strip().str.zfill(6)
+                return df
+        except Exception as e2:
             if self._log:
-                self._log(f"涨停预测：获取实时行情失败 (ak.stock_zh_a_spot_em): {e}")
-            return None
+                self._log(f"涨停预测：新浪实时行情也失败: {e2}")
+        return None
 
     @staticmethod
     def _parse_spot_record(row, exclude_codes: set) -> Optional[Dict[str, Any]]:

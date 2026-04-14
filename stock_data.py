@@ -379,7 +379,8 @@ _EM_CIRCUIT_BREAKER_LOCK = threading.Lock()
 _EM_CIRCUIT_FAIL_COUNT = 0          # 连续失败次数
 _EM_CIRCUIT_OPEN_UNTIL = 0.0        # 熔断截止时间戳
 _EM_CIRCUIT_FAIL_THRESHOLD = 3      # 连续失败几次触发熔断
-_EM_CIRCUIT_COOLDOWN_SEC = 30.0     # 熔断冷却秒数
+_EM_CIRCUIT_COOLDOWN_SEC = 30.0     # 初始熔断冷却秒数
+_EM_CIRCUIT_MAX_COOLDOWN_SEC = 600.0  # 最大熔断冷却（10分钟，应对IP封禁）
 
 
 def _eastmoney_circuit_breaker_open() -> bool:
@@ -390,25 +391,33 @@ def _eastmoney_circuit_breaker_open() -> bool:
         return False
 
 
+_EM_CIRCUIT_CONSECUTIVE_TRIPS = 0  # 连续触发熔断的次数（用于指数退避）
+
 def _eastmoney_circuit_breaker_record_failure() -> None:
-    """记录一次东财请求失败。连续失败达阈值时开启熔断。"""
-    global _EM_CIRCUIT_FAIL_COUNT, _EM_CIRCUIT_OPEN_UNTIL
+    """记录一次东财请求失败。连续失败达阈值时开启熔断，冷却时间指数递增。"""
+    global _EM_CIRCUIT_FAIL_COUNT, _EM_CIRCUIT_OPEN_UNTIL, _EM_CIRCUIT_CONSECUTIVE_TRIPS
     with _EM_CIRCUIT_BREAKER_LOCK:
         _EM_CIRCUIT_FAIL_COUNT += 1
         if _EM_CIRCUIT_FAIL_COUNT >= _EM_CIRCUIT_FAIL_THRESHOLD:
-            _EM_CIRCUIT_OPEN_UNTIL = time.time() + _EM_CIRCUIT_COOLDOWN_SEC
+            _EM_CIRCUIT_CONSECUTIVE_TRIPS += 1
+            cooldown = min(
+                _EM_CIRCUIT_COOLDOWN_SEC * (2 ** (_EM_CIRCUIT_CONSECUTIVE_TRIPS - 1)),
+                _EM_CIRCUIT_MAX_COOLDOWN_SEC,
+            )
+            _EM_CIRCUIT_OPEN_UNTIL = time.time() + cooldown
             logger.warning(
-                "东方财富熔断器已开启：连续 %d 次失败，冷却 %.0fs",
-                _EM_CIRCUIT_FAIL_COUNT, _EM_CIRCUIT_COOLDOWN_SEC,
+                "东方财富熔断器已开启：连续 %d 次失败，冷却 %.0fs（第 %d 次触发）",
+                _EM_CIRCUIT_FAIL_COUNT, cooldown, _EM_CIRCUIT_CONSECUTIVE_TRIPS,
             )
 
 
 def _eastmoney_circuit_breaker_record_success() -> None:
     """记录一次东财请求成功，重置计数。"""
-    global _EM_CIRCUIT_FAIL_COUNT, _EM_CIRCUIT_OPEN_UNTIL
+    global _EM_CIRCUIT_FAIL_COUNT, _EM_CIRCUIT_OPEN_UNTIL, _EM_CIRCUIT_CONSECUTIVE_TRIPS
     with _EM_CIRCUIT_BREAKER_LOCK:
         _EM_CIRCUIT_FAIL_COUNT = 0
         _EM_CIRCUIT_OPEN_UNTIL = 0.0
+        _EM_CIRCUIT_CONSECUTIVE_TRIPS = 0
 
 
 def _global_filter_healthy_urls(urls: List[str]) -> List[str]:
@@ -2887,16 +2896,21 @@ class StockDataFetcher:
 
         plans: List[HistoryRequestPlan] = []
 
-        # 东方财富：每个健康镜像作为独立通道
+        # 东方财富：每个健康镜像作为独立通道（熔断时 auto 模式跳过）
+        em_skipped = False
         if normalized in ("auto", "eastmoney"):
-            mirrors = self.get_available_history_mirrors()
-            for mirror in mirrors:
-                plans.append(HistoryRequestPlan(
-                    mode="network",
-                    provider_sequence=("eastmoney",),
-                    mirror_urls=(mirror,),
-                    reason=f"multi-source-eastmoney-{_history_mirror_host(mirror)}",
-                ))
+            if normalized == "auto" and _eastmoney_circuit_breaker_open():
+                em_skipped = True
+                logger.debug("auto 模式：东财熔断中，跳过东财镜像")
+            else:
+                mirrors = self.get_available_history_mirrors()
+                for mirror in mirrors:
+                    plans.append(HistoryRequestPlan(
+                        mode="network",
+                        provider_sequence=("eastmoney",),
+                        mirror_urls=(mirror,),
+                        reason=f"multi-source-eastmoney-{_history_mirror_host(mirror)}",
+                    ))
 
         # 腾讯/新浪/网易/百度/搜狐：作为补充分流通道（跳过正在冷却的源）
         if normalized in ("auto", "tencent"):
@@ -3098,6 +3112,9 @@ class StockDataFetcher:
             return DataProviderPlan(mode="network", provider_sequence=("eastmoney",), reason="intraday-provider=eastmoney")
         if normalized == "sina":
             return DataProviderPlan(mode="network", provider_sequence=("sina",), reason="intraday-provider=sina")
+        # auto 模式：东财熔断时优先用 sina
+        if _eastmoney_circuit_breaker_open():
+            return DataProviderPlan(mode="network", provider_sequence=("sina", "eastmoney"), reason="intraday-provider=auto(em-circuit-open)")
         return DataProviderPlan(mode="network", provider_sequence=("eastmoney", "sina"), reason="intraday-provider=auto")
 
     def build_fund_flow_request_plan(self, source: str = "auto") -> DataProviderPlan:
@@ -3106,6 +3123,9 @@ class StockDataFetcher:
             return DataProviderPlan(mode="network", provider_sequence=("eastmoney",), reason="fund-flow-provider=eastmoney")
         if normalized == "ths":
             return DataProviderPlan(mode="network", provider_sequence=("ths",), reason="fund-flow-provider=ths")
+        # auto 模式：东财熔断时优先用 ths
+        if _eastmoney_circuit_breaker_open():
+            return DataProviderPlan(mode="network", provider_sequence=("ths", "eastmoney"), reason="fund-flow-provider=auto(em-circuit-open)")
         return DataProviderPlan(mode="network", provider_sequence=("eastmoney", "ths"), reason="fund-flow-provider=auto")
 
     def build_limit_up_reason_plan(self, source: str = "auto") -> DataProviderPlan:
@@ -3188,10 +3208,19 @@ class StockDataFetcher:
                 reason=reason,
             )
 
+        _non_em_providers = ("tencent", "sina", "netease", "baidu", "sohu", "ths", "wscn")
+        if _eastmoney_circuit_breaker_open():
+            # 东财熔断中：auto 模式直接用非东财源，避免无意义的重试
+            return HistoryRequestPlan(
+                mode="network",
+                provider_sequence=_non_em_providers,
+                mirror_urls=(),
+                reason="history-provider=auto(eastmoney-circuit-open)",
+            )
         if mirrors:
             return HistoryRequestPlan(
                 mode="network",
-                provider_sequence=("eastmoney", "tencent", "sina", "netease", "baidu", "sohu", "ths", "wscn"),
+                provider_sequence=("eastmoney",) + _non_em_providers,
                 mirror_urls=mirrors,
                 reason="history-provider=auto",
             )
@@ -3203,7 +3232,7 @@ class StockDataFetcher:
             reason = "history-mirrors-unavailable"
         return HistoryRequestPlan(
             mode="network",
-            provider_sequence=("tencent", "sina", "netease", "baidu", "sohu", "ths", "wscn"),
+            provider_sequence=_non_em_providers,
             mirror_urls=(),
             reason=reason,
         )
@@ -3419,6 +3448,9 @@ class StockDataFetcher:
         last_error: Optional[Exception] = None
         for provider_name in plan.provider_sequence:
             if provider_name == "eastmoney":
+                if _eastmoney_circuit_breaker_open():
+                    logger.debug("强势股池 %s：东财熔断中，跳过", date_key)
+                    continue
                 try:
                     df = _retry_ak_call(ak.stock_zt_pool_strong_em, date=date_key)
                     break
@@ -3474,7 +3506,11 @@ class StockDataFetcher:
                 self._log(f"涨停池 {date_key} 从本地缓存加载 {len(db_cached)} 只")
             return db_cached
 
-        # 3. 网络请求
+        # 3. 网络请求（涨停池目前仅东财有接口）
+        if _eastmoney_circuit_breaker_open():
+            if self._log:
+                self._log(f"涨停池 {date_key}：东财熔断中，暂无替代数据源。可尝试换 IP 或等待冷却结束。")
+            return pd.DataFrame()
         try:
             df = _retry_ak_call(ak.stock_zt_pool_em, date=date_key)
             if df is not None and not df.empty:
@@ -3506,6 +3542,10 @@ class StockDataFetcher:
             self._prev_limit_up_pool_cache[date_key] = db_cached
             return db_cached
 
+        if _eastmoney_circuit_breaker_open():
+            if self._log:
+                self._log(f"昨日涨停池 {date_key}：东财熔断中，暂无替代数据源。")
+            return pd.DataFrame()
         try:
             df = _retry_ak_call(ak.stock_zt_pool_previous_em, date=date_key)
             if df is not None and not df.empty:
