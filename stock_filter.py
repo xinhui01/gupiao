@@ -1565,10 +1565,21 @@ class StockFilter:
         if not trade_dates:
             return {"feature_samples": [], "profile": {}, "sample_count": 0, "trade_dates": []}
 
-        # 收集所有首板涨停股
+        # 收集所有首板涨停股（加总超时保护，防止东财不可达时无限阻塞）
+        import time as _time
+        _pool_deadline = _time.time() + 45.0  # 涨停池获取总时限 45 秒
         all_first_board: List[Dict[str, Any]] = []
         for d in trade_dates:
-            pool = self.fetcher.get_limit_up_pool(d)
+            if _time.time() > _pool_deadline:
+                if self._log:
+                    self._log(f"涨停画像：获取涨停池超时（已超 45s），使用已获取的数据继续")
+                break
+            try:
+                pool = self.fetcher.get_limit_up_pool(d)
+            except Exception as e:
+                if self._log:
+                    self._log(f"涨停画像：获取 {d} 涨停池失败: {e}，跳过该日")
+                continue
             if pool is None or pool.empty:
                 continue
             if "连板数" in pool.columns:
@@ -1767,8 +1778,8 @@ class StockFilter:
             future_spot = executor.submit(_fetch_spot)
 
             try:
-                # 设置超时：涨停池最多30秒
-                future_pool.result(timeout=30.0)
+                # 涨停池最多 15 秒（底层 _gupiao_request_with_retry 有 20s deadline 兜底）
+                future_pool.result(timeout=15.0)
             except FutureTimeoutError as e:
                 if self._log:
                     self._log(f"涨停预测：获取涨停池超时 (get_limit_up_pool): {e}")
@@ -1777,8 +1788,8 @@ class StockFilter:
                     self._log(f"涨停预测：获取涨停池失败 (get_limit_up_pool): {e}")
 
             try:
-                # 全市场行情最多20秒（这个接口很慢，快速跳过）
-                future_spot.result(timeout=20.0)
+                # 全市场行情最多 15 秒
+                future_spot.result(timeout=15.0)
             except FutureTimeoutError as e:
                 if self._log:
                     self._log(f"涨停预测：获取全市场行情超时 (ak.stock_zh_a_spot_em, 5000+只股票): {e}")

@@ -291,25 +291,8 @@ _HISTORY_DIAGNOSTICS: Dict[str, int] = {
 }
 _EASTMONEY_HISTORY_MIRRORS = [
     "https://push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://1.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://7.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://28.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://33.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://36.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://40.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://45.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://51.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://58.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://59.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://60.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://62.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://64.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://72.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://81.push2his.eastmoney.com/api/qt/stock/kline/get",
     "https://82.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://85.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://90.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://95.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://40.push2his.eastmoney.com/api/qt/stock/kline/get",
 ]
 # ---- 全局主机健康管理器 ----
 # 所有数据源（eastmoney / tencent / sina）共用同一个健康状态池，
@@ -382,6 +365,45 @@ def _global_host_cooldown_remaining(url_or_host: str) -> float:
         cooldown_until = _GLOBAL_HOST_HEALTH.get(host, 0.0)
         remain = cooldown_until - now
         return max(0.0, remain)
+
+
+# ---- 东方财富全局熔断器 ----
+# 当 _gupiao_request_with_retry 连续失败达到阈值时触发熔断，
+# 在冷却期内所有东财请求直接快速失败，避免无意义的超长等待。
+_EM_CIRCUIT_BREAKER_LOCK = threading.Lock()
+_EM_CIRCUIT_FAIL_COUNT = 0          # 连续失败次数
+_EM_CIRCUIT_OPEN_UNTIL = 0.0        # 熔断截止时间戳
+_EM_CIRCUIT_FAIL_THRESHOLD = 3      # 连续失败几次触发熔断
+_EM_CIRCUIT_COOLDOWN_SEC = 30.0     # 熔断冷却秒数
+
+
+def _eastmoney_circuit_breaker_open() -> bool:
+    """检查东方财富熔断器是否处于开启（拒绝请求）状态。"""
+    with _EM_CIRCUIT_BREAKER_LOCK:
+        if _EM_CIRCUIT_OPEN_UNTIL > time.time():
+            return True
+        return False
+
+
+def _eastmoney_circuit_breaker_record_failure() -> None:
+    """记录一次东财请求失败。连续失败达阈值时开启熔断。"""
+    global _EM_CIRCUIT_FAIL_COUNT, _EM_CIRCUIT_OPEN_UNTIL
+    with _EM_CIRCUIT_BREAKER_LOCK:
+        _EM_CIRCUIT_FAIL_COUNT += 1
+        if _EM_CIRCUIT_FAIL_COUNT >= _EM_CIRCUIT_FAIL_THRESHOLD:
+            _EM_CIRCUIT_OPEN_UNTIL = time.time() + _EM_CIRCUIT_COOLDOWN_SEC
+            logger.warning(
+                "东方财富熔断器已开启：连续 %d 次失败，冷却 %.0fs",
+                _EM_CIRCUIT_FAIL_COUNT, _EM_CIRCUIT_COOLDOWN_SEC,
+            )
+
+
+def _eastmoney_circuit_breaker_record_success() -> None:
+    """记录一次东财请求成功，重置计数。"""
+    global _EM_CIRCUIT_FAIL_COUNT, _EM_CIRCUIT_OPEN_UNTIL
+    with _EM_CIRCUIT_BREAKER_LOCK:
+        _EM_CIRCUIT_FAIL_COUNT = 0
+        _EM_CIRCUIT_OPEN_UNTIL = 0.0
 
 
 def _global_filter_healthy_urls(urls: List[str]) -> List[str]:
@@ -669,7 +691,7 @@ def _is_name_resolution_error(exc: BaseException) -> bool:
     )
 
 
-def _retry_ak_call(fn: Callable[..., T], *args, retries: int = 5, base_delay: float = 1.2, **kwargs) -> T:
+def _retry_ak_call(fn: Callable[..., T], *args, retries: int = 2, base_delay: float = 1.0, **kwargs) -> T:
     for attempt in range(retries):
         try:
             return fn(*args, **kwargs)
@@ -2469,24 +2491,8 @@ def _eastmoney_request_mirror_urls(url: str) -> List[str]:
     hosts = [
         "push2.eastmoney.com",
         original,
-        "7.push2.eastmoney.com",
-        "28.push2.eastmoney.com",
-        "33.push2.eastmoney.com",
-        "36.push2.eastmoney.com",
-        "40.push2.eastmoney.com",
-        "45.push2.eastmoney.com",
-        "51.push2.eastmoney.com",
-        "58.push2.eastmoney.com",
-        "59.push2.eastmoney.com",
-        "60.push2.eastmoney.com",
-        "62.push2.eastmoney.com",
-        "64.push2.eastmoney.com",
-        "72.push2.eastmoney.com",
-        "81.push2.eastmoney.com",
         "82.push2.eastmoney.com",
-        "85.push2.eastmoney.com",
-        "90.push2.eastmoney.com",
-        "95.push2.eastmoney.com",
+        "40.push2.eastmoney.com",
     ]
     seen: set[str] = set()
     out: List[str] = []
@@ -2505,29 +2511,48 @@ def _eastmoney_request_mirror_urls(url: str) -> List[str]:
 def _gupiao_request_with_retry(
     url: str,
     params: Optional[Dict[str, Any]] = None,
-    timeout: int = 30,
-    max_retries: int = 8,
-    base_delay: float = 1.2,
-    random_delay_range: Tuple[float, float] = (0.6, 2.2),
+    timeout: int = 15,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    random_delay_range: Tuple[float, float] = (0.3, 1.0),
 ):
     """
     替换 akshare 内置 request_with_retry：显式浏览器头、多镜像、更长超时。
     原实现通过 `from ... import request_with_retry` 绑定，必须同时 patch utils.func。
+
+    优化：增加 total deadline（所有镜像+重试合计不超过 20s），防止东财不可达时无限阻塞。
     """
     import random
 
     import requests
     from requests.adapters import HTTPAdapter
 
+    _TOTAL_DEADLINE_SEC = 20.0  # 所有镜像 + 重试的绝对截止时间
+    deadline = time.time() + _TOTAL_DEADLINE_SEC
+
     params = params or {}
-    # fetch_paginated_data 传入 timeout=15，分页多时易断；东方财富接口抬高下限
     if "eastmoney.com" in url:
-        timeout = max(int(timeout or 0), 30)
+        timeout = max(int(timeout or 0), 10)
+
+    # 熔断：如果东财全局处于冷却期，直接快速失败
+    if "eastmoney.com" in url and _eastmoney_circuit_breaker_open():
+        raise RequestsConnectionError(
+            "东方财富接口熔断中（连续失败过多），跳过本次请求"
+        )
+
     last_exception: Optional[BaseException] = None
 
     mirrors = _eastmoney_request_mirror_urls(url)
     for mi, base_url in enumerate(mirrors):
         for attempt in range(max_retries):
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                if last_exception is None:
+                    last_exception = RequestsTimeout(
+                        f"request_with_retry 总时限 {_TOTAL_DEADLINE_SEC:.0f}s 已到"
+                    )
+                raise last_exception
+
             lg = _list_download_log
             if (
                 lg
@@ -2538,10 +2563,10 @@ def _gupiao_request_with_retry(
             ):
                 pn = params.get("pn", "?")
                 lg(
-                    f"列表分页：正在请求第 {pn} 页（共 {len(mirrors)} 个镜像可轮换，"
-                    f"单页可能较慢或多次重试）…"
+                    f"列表分页：正在请求第 {pn} 页（共 {len(mirrors)} 个镜像可轮换）…"
                 )
             try:
+                per_req_timeout = min(timeout, max(2, remaining))
                 with requests.Session() as session:
                     if _use_bypass_proxy():
                         session.trust_env = False
@@ -2552,23 +2577,27 @@ def _gupiao_request_with_retry(
                     req_kw: Dict[str, Any] = {
                         "url": base_url,
                         "params": params,
-                        "timeout": timeout,
+                        "timeout": per_req_timeout,
                         "headers": hdrs,
                     }
                     if _use_insecure_ssl():
                         req_kw["verify"] = False
                     response = session.get(**req_kw)
                     response.raise_for_status()
+                    # 成功：重置熔断计数
+                    if "eastmoney.com" in url:
+                        _eastmoney_circuit_breaker_record_success()
                     return response
             except (requests.RequestException, ValueError) as e:
                 last_exception = e
-                if attempt < max_retries - 1:
-                    delay = base_delay * (2**attempt) + random.uniform(
-                        *random_delay_range
+                if "eastmoney.com" in url:
+                    _eastmoney_circuit_breaker_record_failure()
+                if attempt < max_retries - 1 and (deadline - time.time()) > 1:
+                    delay = min(
+                        base_delay * (1.5 ** attempt) + random.uniform(*random_delay_range),
+                        max(0.5, deadline - time.time() - 1),
                     )
                     time.sleep(delay)
-                else:
-                    time.sleep(random.uniform(0.25, 0.85))
     if last_exception is not None:
         raise last_exception
     raise RuntimeError("request_with_retry: no attempt made")
