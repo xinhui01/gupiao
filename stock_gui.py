@@ -31,6 +31,7 @@ from src.gui.result_columns import (
 from src.gui import result_filters
 from src.gui.ui_dispatch import UIDispatcher
 from src.utils.cancel_token import CancelToken, CancelTokenRegistry
+from src.utils.trade_calendar import _get_trade_calendar, _is_trading_day, _previous_trading_day
 from stock_filter import StockFilter
 from stock_data import clear_history_data, clear_universe_data
 from stock_store import (
@@ -107,6 +108,8 @@ class StockMonitorApp:
         self._predict_cont_sort_reverse = True
         self._predict_first_sort_column = "score"
         self._predict_first_sort_reverse = True
+        self._predict_fresh_sort_column = "score"
+        self._predict_fresh_sort_reverse = True
         self.is_scanning = False
         self.is_updating_cache = False
         self._scan_cancel_token: Optional[CancelToken] = None
@@ -1596,6 +1599,38 @@ class StockMonitorApp:
         self._predict_first_tree.tag_configure("score_mid", background="#fff9c4", foreground="#1f1f1f")
         self._predict_first_tree.tag_configure("score_low", background="#ffecb3", foreground="#1f1f1f")
 
+        # 首板涨停候选 Tab（最近 N 日未涨停、今日量价启动）
+        fresh_tab = ttk.Frame(self._predict_table_nb)
+        self._predict_table_nb.add(fresh_tab, text="首板涨停候选")
+        fresh_cols = ("code", "name", "industry", "change_pct", "close",
+                      "volume_ratio", "dist_ma5", "trend_5d", "position_60d",
+                      "turnover", "score", "reasons")
+        self._predict_fresh_tree = ttk.Treeview(
+            fresh_tab, columns=fresh_cols, show="headings", height=22, style="Predict.Treeview",
+        )
+        for col, (heading, w) in {
+            "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
+            "change_pct": ("今日涨幅%", 75), "close": ("收盘价", 70),
+            "volume_ratio": ("量比", 60), "dist_ma5": ("距MA5%", 65),
+            "trend_5d": ("5日涨幅%", 70), "position_60d": ("60日位置%", 75),
+            "turnover": ("换手%", 65),
+            "score": ("预测分", 65), "reasons": ("预测依据", 300),
+        }.items():
+            self._predict_fresh_tree.heading(
+                col, text=heading,
+                command=lambda c=col: self._on_predict_heading_click("fresh", c),
+            )
+            self._predict_fresh_tree.column(col, width=w, anchor=tk.CENTER if col != "reasons" else tk.W)
+        sb_fresh = ttk.Scrollbar(fresh_tab, orient=tk.VERTICAL, command=self._predict_fresh_tree.yview)
+        self._predict_fresh_tree.configure(yscrollcommand=sb_fresh.set)
+        sb_fresh.pack(side=tk.RIGHT, fill=tk.Y)
+        self._predict_fresh_tree.pack(fill=tk.BOTH, expand=True)
+        self._predict_fresh_tree.bind("<<TreeviewSelect>>", self._on_predict_stock_select)
+        self._predict_fresh_tree.bind("<Double-1>", self._on_predict_stock_double_click)
+        self._predict_fresh_tree.tag_configure("score_high", background="#c8e6c9", foreground="#1f1f1f")
+        self._predict_fresh_tree.tag_configure("score_mid", background="#fff9c4", foreground="#1f1f1f")
+        self._predict_fresh_tree.tag_configure("score_low", background="#ffecb3", foreground="#1f1f1f")
+
         body.add(table_frame, weight=4)
 
         self._predict_thread: Optional[threading.Thread] = None
@@ -1626,6 +1661,9 @@ class StockMonitorApp:
             "burst_ratio": record.get("volume_ratio"),
             "dist_ma5": record.get("dist_ma5_pct"),
             "days_since_burst": record.get("days_since_burst"),
+            "volume_ratio": record.get("volume_ratio"),
+            "trend_5d": record.get("trend_5d"),
+            "position_60d": record.get("position_60d"),
         }
         value = value_map.get(column)
         if column in {"name", "industry", "reasons", "seal_time", "burst_date", "code"}:
@@ -1646,6 +1684,10 @@ class StockMonitorApp:
             column = self._predict_cont_sort_column
             reverse = self._predict_cont_sort_reverse
             secondary = ["score", "boards", "change_pct", "turnover"]
+        elif table_kind == "fresh":
+            column = self._predict_fresh_sort_column
+            reverse = self._predict_fresh_sort_reverse
+            secondary = ["score", "volume_ratio", "change_pct", "turnover"]
         else:
             column = self._predict_first_sort_column
             reverse = self._predict_first_sort_reverse
@@ -1669,6 +1711,12 @@ class StockMonitorApp:
             else:
                 self._predict_cont_sort_column = column
                 self._predict_cont_sort_reverse = column in {"score", "boards", "change_pct", "close", "turnover", "breaks"}
+        elif table_kind == "fresh":
+            if column == self._predict_fresh_sort_column:
+                self._predict_fresh_sort_reverse = not self._predict_fresh_sort_reverse
+            else:
+                self._predict_fresh_sort_column = column
+                self._predict_fresh_sort_reverse = column in {"score", "volume_ratio", "change_pct", "close", "trend_5d", "position_60d", "turnover"}
         else:
             if column == self._predict_first_sort_column:
                 self._predict_first_sort_reverse = not self._predict_first_sort_reverse
@@ -1685,7 +1733,16 @@ class StockMonitorApp:
         trade_date = self._predict_date_var.get().strip()
         if not trade_date:
             trade_date = datetime.now().strftime("%Y%m%d")
-            self._predict_date_var.set(trade_date)
+        # 非交易日（周末/节假日）自动回退到最近一个交易日，避免拿到空涨停池
+        try:
+            parsed = datetime.strptime(trade_date, "%Y%m%d").date()
+            cal = _get_trade_calendar()
+            if not _is_trading_day(parsed, cal):
+                rolled = _previous_trading_day(parsed, cal)
+                trade_date = rolled.strftime("%Y%m%d")
+        except ValueError:
+            pass
+        self._predict_date_var.set(trade_date)
         try:
             lookback = max(2, min(int(self._predict_lookback_var.get().strip() or "5"), 15))
         except ValueError:
@@ -1754,6 +1811,7 @@ class StockMonitorApp:
         self._predict_result = result
         cont_list = self._sort_predict_records(list(result.get("continuation_candidates", [])), "cont")
         first_list = self._sort_predict_records(list(result.get("first_board_candidates", [])), "first")
+        fresh_list = self._sort_predict_records(list(result.get("fresh_first_board_candidates", [])), "fresh")
         hot_industries = result.get("hot_industries", {})
         profile = result.get("profile", {})
         compare_context = result.get("compare_context", {})
@@ -1828,6 +1886,17 @@ class StockMonitorApp:
                     f"  {rec['code']} {rec.get('name', ''):6s}  涨{chg_text:6s}  "
                     f"分={rec['score']:3d}  {rec.get('reasons', '')}\n")
 
+        if fresh_list:
+            txt.insert(tk.END, f"\n{'='*36}\n")
+            txt.insert(tk.END, f"  首板涨停候选 TOP10\n")
+            txt.insert(tk.END, f"{'='*36}\n")
+            for rec in fresh_list[:10]:
+                chg = rec.get("change_pct")
+                chg_text = f"{chg:.1f}%" if chg is not None else "-"
+                txt.insert(tk.END,
+                    f"  {rec['code']} {rec.get('name', ''):6s}  涨{chg_text:6s}  "
+                    f"分={rec['score']:3d}  {rec.get('reasons', '')}\n")
+
         # 热门行业
         if hot_industries:
             txt.insert(tk.END, f"\n{'='*36}\n")
@@ -1882,12 +1951,35 @@ class StockMonitorApp:
             )
             self._predict_first_tree.insert("", tk.END, values=vals, tags=(tag,))
 
+        # ---- 填充首板涨停候选表格 ----
+        self._predict_fresh_tree.delete(*self._predict_fresh_tree.get_children())
+        for rec in fresh_list:
+            tag = self._score_tag(rec.get("score", 0))
+            vals = (
+                rec.get("code", ""),
+                rec.get("name", ""),
+                rec.get("industry", ""),
+                f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
+                f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
+                f"{rec['volume_ratio']:.2f}" if rec.get("volume_ratio") is not None else "-",
+                f"{rec['dist_ma5_pct']:.1f}" if rec.get("dist_ma5_pct") is not None else "-",
+                f"{rec['trend_5d']:.1f}" if rec.get("trend_5d") is not None else "-",
+                f"{rec['position_60d']:.0f}" if rec.get("position_60d") is not None else "-",
+                f"{rec['turnover']:.1f}" if rec.get("turnover") is not None else "-",
+                str(rec.get("score", 0)),
+                rec.get("reasons", ""),
+            )
+            self._predict_fresh_tree.insert("", tk.END, values=vals, tags=(tag,))
+
         # 更新Tab标题显示数量
         self._predict_table_nb.tab(0, text=f"保留涨停候选({len(cont_list)})")
         self._predict_table_nb.tab(1, text=f"五日承接候选({len(first_list)})")
+        self._predict_table_nb.tab(2, text=f"首板涨停候选({len(fresh_list)})")
 
         self._predict_status_label.config(text="")
-        self.status_var.set(f"涨停预测完成: 保留涨停{len(cont_list)}只 / 五日承接{len(first_list)}只")
+        self.status_var.set(
+            f"涨停预测完成: 保留涨停{len(cont_list)}只 / 五日承接{len(first_list)}只 / 首板{len(fresh_list)}只"
+        )
 
     def _on_predict_stock_select(self, event):
         tree = event.widget

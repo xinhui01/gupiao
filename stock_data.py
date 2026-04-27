@@ -2262,30 +2262,26 @@ def _parse_cn_numeric(value: Any) -> Optional[float]:
 
 
 def _fetch_ths_fund_flow_frame(stock_code: str):
-    candidates = (
-        ("stock_fund_flow_individual", ("symbol",)),
-        ("stock_fund_flow_individual", ("stock",)),
-        ("stock_individual_fund_flow_ths", ("symbol",)),
-        ("stock_individual_fund_flow_ths", ("stock",)),
-    )
+    fn = getattr(ak, "stock_individual_fund_flow_ths", None)
+    if fn is None:
+        raise RuntimeError(
+            "同花顺无按股票代码的个股资金流历史接口（stock_fund_flow_individual 仅返回全市场排行），"
+            "请改用东方财富源"
+        )
     last_error: Optional[Exception] = None
-    for func_name, arg_names in candidates:
-        fn = getattr(ak, func_name, None)
-        if fn is None:
-            continue
-        kwargs = {}
-        for arg_name in arg_names:
-            kwargs[arg_name] = stock_code
+    for kwargs in ({"stock": stock_code}, {"symbol": stock_code}):
         try:
             df = _retry_ak_call(fn, **kwargs)
             if df is not None and not getattr(df, "empty", True):
                 return df
-        except Exception as exc:
+        except TypeError as exc:
             last_error = exc
             continue
+        except Exception as exc:
+            raise exc
     if last_error is not None:
         raise last_error
-    raise RuntimeError("ths-fund-flow-function-unavailable")
+    raise RuntimeError("ths-fund-flow-empty")
 
 def clear_universe_data() -> None:
     """清空已保存的股票池和扫描快照。"""
