@@ -680,6 +680,17 @@ class StockMonitorApp:
         self._apply_predict_result(payload)
         self.status_var.set(f"已加载 {trade_date} 的涨停预测历史")
 
+    def _refresh_selected_predict_date(self) -> None:
+        """重新预测下拉中选中的历史日期，并覆盖原记录。"""
+        trade_date = (self._predict_history_var.get() or "").strip()
+        if not trade_date:
+            trade_date = (self._predict_date_var.get() or "").strip()
+        if not trade_date:
+            self._predict_status_label.config(text="请先选择要刷新的日期")
+            return
+        self._predict_date_var.set(trade_date)
+        self._start_predict()
+
     def _save_result_column_layout(self) -> None:
         payload = {
             "order": list(self.result_column_order or self.result_columns),
@@ -1589,6 +1600,10 @@ class StockMonitorApp:
         self._predict_status_label.pack(side=tk.RIGHT, padx=8)
 
         # 历史记录选择：可按日期查看每天的预测数据
+        ttk.Button(
+            action_bar, text="刷新此日期",
+            command=self._refresh_selected_predict_date,
+        ).pack(side=tk.RIGHT, padx=(4, 0))
         ttk.Label(action_bar, text="历史记录:").pack(side=tk.RIGHT, padx=(12, 2))
         self._predict_history_var = tk.StringVar(value="")
         self._predict_history_combo = ttk.Combobox(
