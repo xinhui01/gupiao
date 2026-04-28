@@ -2654,7 +2654,7 @@ class StockFilter:
         seen: set = set()
         for rec in self._filter_strong_stocks(spot_df, zt_codes):
             chg = rec.get("change_pct")
-            if chg is None or chg < 4.0 or chg >= 9.5:
+            if chg is None or chg < 3.0 or chg >= 9.5:
                 continue
             if rec["code"] in seen:
                 continue
@@ -2743,6 +2743,9 @@ class StockFilter:
             elif change_pct >= 4.0:
                 score += 10
                 reasons.append(f"涨{change_pct:.1f}%突破+10")
+            elif change_pct >= 3.0:
+                score += 5
+                reasons.append(f"涨{change_pct:.1f}%温和启动+5")
 
         # 2. 量比放大
         vol_ratio = None
