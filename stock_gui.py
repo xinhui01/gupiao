@@ -41,9 +41,11 @@ from stock_store import (
     export_watchlist_csv,
     import_watchlist_csv,
     list_backups,
+    list_limit_up_prediction_dates,
     load_app_config,
     load_last_limit_up_prediction,
     load_latest_scan_snapshot,
+    load_limit_up_prediction_by_date,
     load_scan_snapshot,
     load_watchlist,
     load_watchlist_item,
@@ -642,12 +644,41 @@ class StockMonitorApp:
 
     def _load_last_limit_up_prediction(self) -> None:
         payload = load_last_limit_up_prediction()
+        self._refresh_predict_history_dates()
         if not isinstance(payload, dict):
             return
         trade_date = str(payload.get("trade_date") or "").strip()
         if trade_date:
             self._predict_date_var.set(trade_date)
+            if hasattr(self, "_predict_history_var"):
+                self._predict_history_var.set(trade_date)
         self._apply_predict_result(payload)
+
+    def _refresh_predict_history_dates(self, select: Optional[str] = None) -> None:
+        """刷新历史记录下拉框；可选地选中指定日期。"""
+        if not hasattr(self, "_predict_history_combo"):
+            return
+        try:
+            dates = list_limit_up_prediction_dates()
+        except Exception:
+            dates = []
+        self._predict_history_combo["values"] = dates
+        if select and select in dates:
+            self._predict_history_var.set(select)
+        elif not self._predict_history_var.get() and dates:
+            self._predict_history_var.set(dates[0])
+
+    def _on_predict_history_selected(self, _event=None) -> None:
+        trade_date = (self._predict_history_var.get() or "").strip()
+        if not trade_date:
+            return
+        payload = load_limit_up_prediction_by_date(trade_date)
+        if not isinstance(payload, dict):
+            self._predict_status_label.config(text=f"无 {trade_date} 的历史预测")
+            return
+        self._predict_date_var.set(trade_date)
+        self._apply_predict_result(payload)
+        self.status_var.set(f"已加载 {trade_date} 的涨停预测历史")
 
     def _save_result_column_layout(self) -> None:
         payload = {
@@ -1557,6 +1588,18 @@ class StockMonitorApp:
         self._predict_status_label = ttk.Label(action_bar, text="")
         self._predict_status_label.pack(side=tk.RIGHT, padx=8)
 
+        # 历史记录选择：可按日期查看每天的预测数据
+        ttk.Label(action_bar, text="历史记录:").pack(side=tk.RIGHT, padx=(12, 2))
+        self._predict_history_var = tk.StringVar(value="")
+        self._predict_history_combo = ttk.Combobox(
+            action_bar, textvariable=self._predict_history_var,
+            width=12, state="readonly", values=(),
+        )
+        self._predict_history_combo.pack(side=tk.RIGHT)
+        self._predict_history_combo.bind(
+            "<<ComboboxSelected>>", self._on_predict_history_selected,
+        )
+
         # ---- 主区域：左侧摘要 + 右侧表格 ----
         body = ttk.PanedWindow(predict_frame, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True)
@@ -2030,6 +2073,10 @@ class StockMonitorApp:
         self.status_var.set(
             f"涨停预测完成: 保留涨停{len(cont_list)}只 / 五日承接{len(first_list)}只 / 首板{len(fresh_list)}只"
         )
+
+        # 同步刷新历史记录下拉，并选中当前结果对应的日期
+        current_date = str(result.get("trade_date") or "").strip()
+        self._refresh_predict_history_dates(select=current_date or None)
 
     def _on_predict_stock_select(self, event):
         tree = event.widget

@@ -15,7 +15,7 @@ from src.services.history_analysis_service import HistoryAnalysisService
 from src.utils.cancel_token import CancelToken, coerce_should_stop
 from stock_data import StockDataFetcher, DaemonThreadPoolExecutor
 from stock_logger import get_logger
-from stock_store import save_last_limit_up_prediction
+from stock_store import save_last_limit_up_prediction, save_limit_up_prediction_record
 
 logger = get_logger(__name__)
 
@@ -1892,6 +1892,10 @@ class StockFilter:
                 save_last_limit_up_prediction(result)
             except Exception:
                 pass
+            try:
+                save_limit_up_prediction_record(result)
+            except Exception:
+                pass
             return result
 
         all_pool_records = self._parse_full_pool(today_pool_df)
@@ -2001,6 +2005,10 @@ class StockFilter:
         }
         try:
             save_last_limit_up_prediction(result)
+        except Exception:
+            pass
+        try:
+            save_limit_up_prediction_record(result)
         except Exception:
             pass
         return result

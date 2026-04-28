@@ -223,6 +223,17 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             added_at TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL DEFAULT ''
         );
+
+        CREATE TABLE IF NOT EXISTS limit_up_predictions (
+            trade_date TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            cont_count INTEGER NOT NULL DEFAULT 0,
+            first_count INTEGER NOT NULL DEFAULT 0,
+            fresh_count INTEGER NOT NULL DEFAULT 0,
+            predicted_at TEXT NOT NULL DEFAULT '',
+            saved_at TEXT NOT NULL DEFAULT ''
+        );
         """
     )
     existing_columns = {
@@ -943,6 +954,106 @@ def load_last_limit_up_prediction() -> Optional[Dict[str, Any]]:
     except Exception:
         logger.exception("读取上次涨停预测结果失败")
         return None
+
+
+def save_limit_up_prediction_record(payload: Dict[str, Any]) -> None:
+    """按 trade_date 持久化每次涨停预测结果到 `limit_up_predictions` 表。
+
+    同一交易日重复预测会覆盖之前的记录（PK 为 trade_date）。
+    """
+    if not isinstance(payload, dict):
+        return
+    trade_date = str(payload.get("trade_date") or "").strip()
+    if not trade_date:
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        payload_json = json.dumps(payload, ensure_ascii=False, default=str)
+    except Exception:
+        logger.exception("序列化涨停预测结果失败")
+        return
+    summary = str(payload.get("summary") or "")
+    cont_count = len(payload.get("continuation_candidates") or [])
+    first_count = len(payload.get("first_board_candidates") or [])
+    fresh_count = len(payload.get("fresh_first_board_candidates") or [])
+
+    def _write():
+        with _connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO limit_up_predictions(
+                    trade_date, payload_json, summary,
+                    cont_count, first_count, fresh_count,
+                    predicted_at, saved_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_date) DO UPDATE SET
+                    payload_json=excluded.payload_json,
+                    summary=excluded.summary,
+                    cont_count=excluded.cont_count,
+                    first_count=excluded.first_count,
+                    fresh_count=excluded.fresh_count,
+                    predicted_at=excluded.predicted_at,
+                    saved_at=excluded.saved_at
+                """,
+                (
+                    trade_date, payload_json, summary,
+                    int(cont_count), int(first_count), int(fresh_count),
+                    now, now,
+                ),
+            )
+
+    try:
+        with _DB_WRITE_LOCK:
+            _retry_locked(_write)
+    except Exception:
+        logger.exception("保存涨停预测历史记录失败")
+
+
+def load_limit_up_prediction_by_date(trade_date: str) -> Optional[Dict[str, Any]]:
+    """按交易日读取已保存的涨停预测结果，未找到返回 None。"""
+    td = str(trade_date or "").strip()
+    if not td or not _DB_PATH.is_file():
+        return None
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(
+                "SELECT payload_json FROM limit_up_predictions WHERE trade_date = ?",
+                (td,),
+            ).fetchone()
+
+    try:
+        row = _retry_locked(_read)
+    except Exception:
+        logger.exception("读取涨停预测历史记录失败")
+        return None
+    if row is None:
+        return None
+    try:
+        return json.loads(row["payload_json"])
+    except Exception:
+        logger.exception("解析涨停预测历史记录失败")
+        return None
+
+
+def list_limit_up_prediction_dates() -> List[str]:
+    """列出所有已保存涨停预测的交易日，按日期降序返回。"""
+    if not _DB_PATH.is_file():
+        return []
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(
+                "SELECT trade_date FROM limit_up_predictions ORDER BY trade_date DESC"
+            ).fetchall()
+
+    try:
+        rows = _retry_locked(_read)
+    except Exception:
+        logger.exception("列出涨停预测历史日期失败")
+        return []
+    return [str(row["trade_date"]) for row in rows if row and row["trade_date"]]
 
 
 def save_intraday_cache(
