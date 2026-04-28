@@ -117,6 +117,8 @@ class StockMonitorApp:
         self._predict_fresh_sort_reverse = True
         self._predict_wrap_sort_column = "score"
         self._predict_wrap_sort_reverse = True
+        self._predict_trend_sort_column = "score"
+        self._predict_trend_sort_reverse = True
         self._top_header_name_by_code: Dict[str, str] = {}
         self.is_scanning = False
         self.is_updating_cache = False
@@ -1849,6 +1851,41 @@ class StockMonitorApp:
         self._predict_wrap_tree.tag_configure("score_mid", background="#fff9c4", foreground="#1f1f1f")
         self._predict_wrap_tree.tag_configure("score_low", background="#ffecb3", foreground="#1f1f1f")
 
+        # 趋势涨停候选 Tab（多头排列稳健上行）
+        trend_tab = ttk.Frame(self._predict_table_nb)
+        self._predict_table_nb.add(trend_tab, text="趋势涨停候选")
+        trend_cols = ("code", "name", "industry", "change_pct", "close",
+                      "ma_spread", "dist_ma5", "ma20_slope",
+                      "trend_5d", "trend_10d", "position_60d",
+                      "volume_ratio", "score", "reasons")
+        self._predict_trend_tree = ttk.Treeview(
+            trend_tab, columns=trend_cols, show="headings", height=22, style="Predict.Treeview",
+        )
+        for col, (heading, w) in {
+            "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
+            "change_pct": ("今日涨幅%", 75), "close": ("收盘价", 70),
+            "ma_spread": ("多头开口%", 75), "dist_ma5": ("距MA5%", 65),
+            "ma20_slope": ("MA20斜率%", 80),
+            "trend_5d": ("5日涨幅%", 70), "trend_10d": ("10日涨幅%", 75),
+            "position_60d": ("60日位置%", 75),
+            "volume_ratio": ("量比", 60),
+            "score": ("预测分", 65), "reasons": ("预测依据", 300),
+        }.items():
+            self._predict_trend_tree.heading(
+                col, text=heading,
+                command=lambda c=col: self._on_predict_heading_click("trend", c),
+            )
+            self._predict_trend_tree.column(col, width=w, anchor=tk.CENTER if col != "reasons" else tk.W)
+        sb_trend = ttk.Scrollbar(trend_tab, orient=tk.VERTICAL, command=self._predict_trend_tree.yview)
+        self._predict_trend_tree.configure(yscrollcommand=sb_trend.set)
+        sb_trend.pack(side=tk.RIGHT, fill=tk.Y)
+        self._predict_trend_tree.pack(fill=tk.BOTH, expand=True)
+        self._predict_trend_tree.bind("<<TreeviewSelect>>", self._on_predict_stock_select)
+        self._predict_trend_tree.bind("<Double-1>", self._on_predict_stock_double_click)
+        self._predict_trend_tree.tag_configure("score_high", background="#c8e6c9", foreground="#1f1f1f")
+        self._predict_trend_tree.tag_configure("score_mid", background="#fff9c4", foreground="#1f1f1f")
+        self._predict_trend_tree.tag_configure("score_low", background="#ffecb3", foreground="#1f1f1f")
+
         body.add(table_frame, weight=4)
 
         self._predict_thread: Optional[threading.Thread] = None
@@ -1887,6 +1924,9 @@ class StockMonitorApp:
             "wrap_gap": record.get("wrap_gap_pct"),
             "days_since_lu": record.get("days_since_lu"),
             "worst_drop": record.get("worst_drop"),
+            "ma_spread": record.get("ma_spread_pct"),
+            "ma20_slope": record.get("ma20_slope_pct"),
+            "trend_10d": record.get("trend_10d"),
         }
         value = value_map.get(column)
         if column in {"name", "industry", "reasons", "seal_time", "burst_date", "code", "prior_lu_date"}:
@@ -1915,6 +1955,10 @@ class StockMonitorApp:
             column = self._predict_wrap_sort_column
             reverse = self._predict_wrap_sort_reverse
             secondary = ["score", "wrap_gap", "change_pct", "volume_ratio"]
+        elif table_kind == "trend":
+            column = self._predict_trend_sort_column
+            reverse = self._predict_trend_sort_reverse
+            secondary = ["score", "ma_spread", "change_pct", "volume_ratio"]
         else:
             column = self._predict_first_sort_column
             reverse = self._predict_first_sort_reverse
@@ -1951,6 +1995,15 @@ class StockMonitorApp:
                 self._predict_wrap_sort_column = column
                 # 反包缺口越小越好，因此 wrap_gap / days_since_lu 默认升序
                 self._predict_wrap_sort_reverse = column in {"score", "change_pct", "close", "volume_ratio", "prior_lu_close"}
+        elif table_kind == "trend":
+            if column == self._predict_trend_sort_column:
+                self._predict_trend_sort_reverse = not self._predict_trend_sort_reverse
+            else:
+                self._predict_trend_sort_column = column
+                self._predict_trend_sort_reverse = column in {
+                    "score", "change_pct", "close", "volume_ratio", "ma_spread",
+                    "ma20_slope", "trend_5d", "trend_10d", "position_60d",
+                }
         else:
             if column == self._predict_first_sort_column:
                 self._predict_first_sort_reverse = not self._predict_first_sort_reverse
@@ -2047,6 +2100,7 @@ class StockMonitorApp:
         first_list = self._sort_predict_records(list(result.get("first_board_candidates", [])), "first")
         fresh_list = self._sort_predict_records(list(result.get("fresh_first_board_candidates", [])), "fresh")
         wrap_list = self._sort_predict_records(list(result.get("broken_board_wrap_candidates", [])), "wrap")
+        trend_list = self._sort_predict_records(list(result.get("trend_limit_up_candidates", [])), "trend")
         hot_industries = result.get("hot_industries", {})
         profile = result.get("profile", {})
         compare_context = result.get("compare_context", {})
@@ -2145,6 +2199,19 @@ class StockMonitorApp:
                     f"  {rec['code']} {rec.get('name', ''):6s}  涨{chg_text:6s} {gap_text:7s}  "
                     f"分={rec['score']:3d}  {rec.get('reasons', '')}\n")
 
+        if trend_list:
+            txt.insert(tk.END, f"\n{'='*36}\n")
+            txt.insert(tk.END, f"  趋势涨停候选 TOP10\n")
+            txt.insert(tk.END, f"{'='*36}\n")
+            for rec in trend_list[:10]:
+                chg = rec.get("change_pct")
+                chg_text = f"{chg:.1f}%" if chg is not None else "-"
+                spread = rec.get("ma_spread_pct")
+                spread_text = f"开口{spread:.1f}%" if spread is not None else "-"
+                txt.insert(tk.END,
+                    f"  {rec['code']} {rec.get('name', ''):6s}  涨{chg_text:6s} {spread_text:9s}  "
+                    f"分={rec['score']:3d}  {rec.get('reasons', '')}\n")
+
         # 热门行业
         if hot_industries:
             txt.insert(tk.END, f"\n{'='*36}\n")
@@ -2240,16 +2307,39 @@ class StockMonitorApp:
             )
             self._predict_wrap_tree.insert("", tk.END, values=vals, tags=(tag,))
 
+        # ---- 填充趋势涨停候选表格 ----
+        self._predict_trend_tree.delete(*self._predict_trend_tree.get_children())
+        for rec in trend_list:
+            tag = self._score_tag(rec.get("score", 0))
+            vals = (
+                rec.get("code", ""),
+                rec.get("name", ""),
+                rec.get("industry", ""),
+                f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
+                f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
+                f"{rec['ma_spread_pct']:.2f}" if rec.get("ma_spread_pct") is not None else "-",
+                f"{rec['dist_ma5_pct']:+.1f}" if rec.get("dist_ma5_pct") is not None else "-",
+                f"{rec['ma20_slope_pct']:.2f}" if rec.get("ma20_slope_pct") is not None else "-",
+                f"{rec['trend_5d']:+.1f}" if rec.get("trend_5d") is not None else "-",
+                f"{rec['trend_10d']:+.1f}" if rec.get("trend_10d") is not None else "-",
+                f"{rec['position_60d']:.0f}" if rec.get("position_60d") is not None else "-",
+                f"{rec['volume_ratio']:.2f}" if rec.get("volume_ratio") is not None else "-",
+                str(rec.get("score", 0)),
+                rec.get("reasons", ""),
+            )
+            self._predict_trend_tree.insert("", tk.END, values=vals, tags=(tag,))
+
         # 更新Tab标题显示数量
         self._predict_table_nb.tab(0, text=f"保留涨停候选({len(cont_list)})")
         self._predict_table_nb.tab(1, text=f"五日承接候选({len(first_list)})")
         self._predict_table_nb.tab(2, text=f"首板涨停候选({len(fresh_list)})")
         self._predict_table_nb.tab(3, text=f"断板反包候选({len(wrap_list)})")
+        self._predict_table_nb.tab(4, text=f"趋势涨停候选({len(trend_list)})")
 
         self._predict_status_label.config(text="")
         self.status_var.set(
             f"涨停预测完成: 保留涨停{len(cont_list)} / 五日承接{len(first_list)} / "
-            f"首板{len(fresh_list)} / 反包{len(wrap_list)}"
+            f"首板{len(fresh_list)} / 反包{len(wrap_list)} / 趋势{len(trend_list)}"
         )
 
         # 同步刷新历史记录下拉，并选中当前结果对应的日期

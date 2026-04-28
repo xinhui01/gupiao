@@ -1924,6 +1924,7 @@ class StockFilter:
                 "first_board_candidates": [],
                 "fresh_first_board_candidates": [],
                 "broken_board_wrap_candidates": [],
+                "trend_limit_up_candidates": [],
                 "hot_industries": {},
                 "summary": summary,
             }
@@ -2019,6 +2020,13 @@ class StockFilter:
             spot_df, zt_codes, hot_industries, compare_context, progress_callback,
         )
 
+        # 阶段8：趋势涨停候选（多头排列、稳健上行）
+        if self._log:
+            self._log("涨停预测：阶段8 - 识别趋势涨停候选...")
+        trend_limit_up_candidates = self._scan_trend_limit_up_candidates_cached(
+            spot_df, zt_codes, hot_industries, compare_context, progress_callback,
+        )
+
         # 摘要
         summary_lines = [
             f"预测日期：基于 {trade_date} 数据预测次日涨停候选",
@@ -2028,6 +2036,7 @@ class StockFilter:
             f"五日承接候选：{len(first_board_candidates)} 只（得分>=50）",
             f"首板涨停候选：{len(fresh_first_board_candidates)} 只（10日未涨停，得分>=50）",
             f"断板反包候选：{len(broken_board_wrap_candidates)} 只（近期涨停被打掉，得分>=50）",
+            f"趋势涨停候选：{len(trend_limit_up_candidates)} 只（多头排列稳健上行，得分>=50）",
         ]
         latest_cont_rate = compare_context.get("latest_continuation_rate")
         avg_cont_rate = compare_context.get("avg_continuation_rate")
@@ -2047,6 +2056,7 @@ class StockFilter:
             "first_board_candidates": first_board_candidates,
             "fresh_first_board_candidates": fresh_first_board_candidates,
             "broken_board_wrap_candidates": broken_board_wrap_candidates,
+            "trend_limit_up_candidates": trend_limit_up_candidates,
             "hot_industries": hot_industries,
             "compare_context": compare_context,
             "summary": "\n".join(summary_lines),
@@ -3110,6 +3120,286 @@ class StockFilter:
             "score": final_score,
             "reasons": " / ".join(reasons[:8]),
             "predict_type": "断板反包",
+        }
+
+    def _scan_trend_limit_up_candidates_cached(
+        self,
+        spot_df: Optional[pd.DataFrame],
+        zt_codes: set,
+        hot_industries: Dict[str, int],
+        compare_context: Dict[str, Any],
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    ) -> List[Dict[str, Any]]:
+        """识别"趋势涨停"候选：均线多头排列、稳健上行的票，明日有望趋势加速涨停。
+
+        与"首板涨停候选"区别：
+        - 首板候选要求最近 10 日无涨停（冷启动），关注从沉寂到爆发
+        - 趋势候选关注已经在多头排列里"温和上攻"的票，可能有过近期涨停
+        """
+        if spot_df is None or spot_df.empty:
+            return []
+
+        seen: set = set()
+        merged: List[Dict[str, Any]] = []
+        for rec in self._filter_strong_stocks(spot_df, zt_codes):
+            if rec["code"] in seen:
+                continue
+            seen.add(rec["code"])
+            merged.append(rec)
+        for rec in self._filter_ma5_pullback_stocks(spot_df, zt_codes):
+            if rec["code"] in seen:
+                continue
+            seen.add(rec["code"])
+            merged.append(rec)
+        if not merged:
+            return []
+
+        candidates: List[Dict[str, Any]] = []
+        total = len(merged)
+        for idx, rec in enumerate(merged):
+            score_info = self._score_trend_limit_up(
+                rec, hot_industries, compare_context,
+            )
+            if score_info is not None and score_info["score"] >= 50:
+                candidates.append(score_info)
+            if progress_callback:
+                progress_callback(idx + 1, total, f"趋势筛选 {rec['code']} {rec.get('name', '')}")
+
+        candidates.sort(key=lambda x: -x["score"])
+        return candidates[:50]
+
+    def _score_trend_limit_up(
+        self,
+        rec: Dict[str, Any],
+        hot_industries: Dict[str, int],
+        compare_context: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """对趋势涨停候选评分。
+
+        触发条件（强制）：
+        1. MA5 > MA10 > MA20 多头排列
+        2. 今日收盘 ≥ MA5（在趋势之上）
+        3. MA20 5 日斜率 > 0（中期趋势抬头）
+        4. 60 日位置 40~92（中位偏上、避开极顶）
+        """
+        code = rec["code"]
+        name = rec.get("name", "")
+        change_pct = rec.get("change_pct")
+        turnover = rec.get("turnover")
+        industry = rec.get("industry", "")
+
+        try:
+            history = self.fetcher.get_history_data(
+                code, days=65, force_refresh=False,
+                request_plan=self._build_local_cache_history_plan(reason="predict-trend-cache-only"),
+            )
+        except Exception as exc:
+            logger.debug("趋势涨停预测获取历史 %s 失败: %s", code, exc)
+            history = None
+
+        if history is None or history.empty or len(history) < 25:
+            return None
+
+        df = history.sort_values("date").reset_index(drop=True)
+        close = pd.to_numeric(df["close"], errors="coerce")
+        volume = pd.to_numeric(df.get("volume"), errors="coerce") if "volume" in df.columns else pd.Series(dtype=float)
+
+        t = len(df) - 1
+        latest_close = float(close.iloc[t]) if not pd.isna(close.iloc[t]) else rec.get("close")
+        if latest_close is None or latest_close <= 0:
+            return None
+
+        ma5 = close.rolling(5, min_periods=5).mean()
+        ma10 = close.rolling(10, min_periods=10).mean()
+        ma20 = close.rolling(20, min_periods=20).mean()
+        ma5_val = float(ma5.iloc[t]) if not pd.isna(ma5.iloc[t]) else None
+        ma10_val = float(ma10.iloc[t]) if not pd.isna(ma10.iloc[t]) else None
+        ma20_val = float(ma20.iloc[t]) if not pd.isna(ma20.iloc[t]) else None
+        if ma5_val is None or ma10_val is None or ma20_val is None:
+            return None
+
+        # 1) 多头排列
+        if not (ma5_val > ma10_val > ma20_val):
+            return None
+        # 2) 站上 MA5
+        if latest_close < ma5_val * 0.995:
+            return None
+        # 3) MA20 抬头
+        if t < 25 or pd.isna(ma20.iloc[t - 5]):
+            return None
+        ma20_slope = float(ma20.iloc[t]) - float(ma20.iloc[t - 5])
+        if ma20_slope <= 0:
+            return None
+        ma20_slope_pct = round(ma20_slope / float(ma20.iloc[t - 5]) * 100, 2) if float(ma20.iloc[t - 5]) > 0 else 0.0
+
+        # 4) 60 日位置
+        position_60d = None
+        if t >= 60:
+            window60 = close.iloc[t - 60:t + 1].dropna()
+            if not window60.empty:
+                hi = float(window60.max())
+                lo = float(window60.min())
+                if hi > lo:
+                    position_60d = round((latest_close - lo) / (hi - lo) * 100, 1)
+        if position_60d is None or position_60d < 40 or position_60d > 92:
+            return None
+
+        score = 0.0
+        reasons: List[str] = []
+
+        # 多头排列强度（MA5/MA20 的开口）
+        ma_spread_pct = round((ma5_val - ma20_val) / ma20_val * 100, 2)
+        if ma_spread_pct >= 8:
+            score += 22
+            reasons.append(f"多头开口{ma_spread_pct:.1f}%+22")
+        elif ma_spread_pct >= 4:
+            score += 18
+            reasons.append(f"多头开口{ma_spread_pct:.1f}%+18")
+        elif ma_spread_pct >= 1.5:
+            score += 12
+            reasons.append(f"多头排列{ma_spread_pct:.1f}%+12")
+        else:
+            score += 5
+            reasons.append(f"刚刚多头{ma_spread_pct:.1f}%+5")
+
+        # 距 MA5：紧贴 MA5 (0~3%) 是甜区，太远扣分
+        dist_ma5_pct = round((latest_close / ma5_val - 1) * 100, 2)
+        if 0 <= dist_ma5_pct <= 3:
+            score += 14
+            reasons.append(f"贴MA5({dist_ma5_pct:+.1f}%)+14")
+        elif 3 < dist_ma5_pct <= 6:
+            score += 8
+            reasons.append(f"距MA5 {dist_ma5_pct:.1f}%+8")
+        elif dist_ma5_pct > 10:
+            score -= 8
+            reasons.append(f"距MA5 {dist_ma5_pct:.1f}%过远-8")
+
+        # 今日动能
+        if change_pct is not None:
+            if change_pct >= 7.0:
+                score += 22
+                reasons.append(f"今涨{change_pct:.1f}%临界涨停+22")
+            elif change_pct >= 4.0:
+                score += 14
+                reasons.append(f"今涨{change_pct:.1f}%上攻+14")
+            elif change_pct >= 1.5:
+                score += 8
+                reasons.append(f"今涨{change_pct:.1f}%稳健+8")
+            elif change_pct < -1.5:
+                score -= 6
+                reasons.append(f"今跌{change_pct:.1f}%-6")
+
+        # 量比：温和放量 (1.2~2.5) 最好；爆量(>3) 反而要警惕加速顶
+        vol_ratio: Optional[float] = None
+        if len(volume) >= 6 and not pd.isna(volume.iloc[t]):
+            vol_window = volume.iloc[max(0, t - 5):t].dropna()
+            if not vol_window.empty and float(vol_window.mean()) > 0:
+                vol_ratio = round(float(volume.iloc[t]) / float(vol_window.mean()), 2)
+        if vol_ratio is not None:
+            if 1.2 <= vol_ratio <= 2.5:
+                score += 14
+                reasons.append(f"量比{vol_ratio:.1f}x健康+14")
+            elif 2.5 < vol_ratio <= 3.5:
+                score += 8
+                reasons.append(f"量比{vol_ratio:.1f}x偏热+8")
+            elif vol_ratio > 3.5:
+                score -= 4
+                reasons.append(f"量比{vol_ratio:.1f}x过热-4")
+            elif vol_ratio < 0.7:
+                score -= 8
+                reasons.append(f"量比{vol_ratio:.1f}x缩量-8")
+            else:
+                score += 4
+                reasons.append(f"量比{vol_ratio:.1f}x+4")
+
+        # 5/10 日趋势
+        trend_5d = None
+        trend_10d = None
+        if t >= 5 and not pd.isna(close.iloc[t - 5]) and float(close.iloc[t - 5]) > 0:
+            trend_5d = round((latest_close / float(close.iloc[t - 5]) - 1) * 100, 1)
+        if t >= 10 and not pd.isna(close.iloc[t - 10]) and float(close.iloc[t - 10]) > 0:
+            trend_10d = round((latest_close / float(close.iloc[t - 10]) - 1) * 100, 1)
+        if trend_5d is not None:
+            if 2 <= trend_5d <= 12:
+                score += 8
+                reasons.append(f"5日{trend_5d:+.1f}%稳健+8")
+            elif 12 < trend_5d <= 22:
+                score += 4
+                reasons.append(f"5日{trend_5d:+.1f}%偏快+4")
+            elif trend_5d > 25:
+                score -= 8
+                reasons.append(f"5日{trend_5d:+.1f}%过急-8")
+
+        # 60 日位置：50~80 中位偏上为最佳
+        if 50 <= position_60d <= 80:
+            score += 10
+            reasons.append(f"60日位置{position_60d:.0f}%中位+10")
+        elif 80 < position_60d <= 90:
+            score += 4
+            reasons.append(f"60日位置{position_60d:.0f}%偏高+4")
+        else:
+            score += 2
+            reasons.append(f"60日位置{position_60d:.0f}%+2")
+
+        # MA20 抬头
+        if ma20_slope_pct >= 1.0:
+            score += 8
+            reasons.append(f"MA20 5日抬头{ma20_slope_pct:.1f}%+8")
+        elif ma20_slope_pct >= 0.3:
+            score += 4
+            reasons.append(f"MA20 5日抬头{ma20_slope_pct:.1f}%+4")
+
+        # 行业
+        if industry and hot_industries.get(industry, 0) >= 3:
+            score += 10
+            reasons.append(f"热门板块({hot_industries[industry]}只)+10")
+        elif industry and hot_industries.get(industry, 0) >= 2:
+            score += 5
+            reasons.append(f"板块联动({hot_industries[industry]}只)+5")
+
+        # 换手率
+        if turnover is not None:
+            if 3 <= turnover <= 12:
+                score += 6
+                reasons.append(f"换手{turnover:.1f}%健康+6")
+            elif 12 < turnover <= 22:
+                score += 2
+                reasons.append(f"换手{turnover:.1f}%偏高+2")
+            elif turnover > 30:
+                score -= 6
+                reasons.append(f"换手{turnover:.1f}%过热-6")
+
+        # 大盘环境
+        latest_cont_rate = compare_context.get("latest_continuation_rate")
+        if latest_cont_rate is not None:
+            if latest_cont_rate >= 60:
+                score += 4
+                reasons.append(f"晋级率{latest_cont_rate:.0f}%+4")
+            elif latest_cont_rate < 25:
+                score -= 4
+                reasons.append(f"晋级率{latest_cont_rate:.0f}%-4")
+
+        final_score = max(0, min(100, int(round(score))))
+        return {
+            "code": code,
+            "name": name,
+            "industry": industry,
+            "close": latest_close,
+            "change_pct": change_pct,
+            "turnover": turnover,
+            "ma5": ma5_val,
+            "ma10": ma10_val,
+            "ma20": ma20_val,
+            "ma_spread_pct": ma_spread_pct,
+            "ma20_slope_pct": ma20_slope_pct,
+            "dist_ma5_pct": dist_ma5_pct,
+            "position_60d": position_60d,
+            "trend_5d": trend_5d,
+            "trend_10d": trend_10d,
+            "volume_ratio": vol_ratio,
+            "score": final_score,
+            "reasons": " / ".join(reasons[:8]),
+            "predict_type": "趋势涨停",
         }
 
     def _scan_first_board_candidates_cached(
