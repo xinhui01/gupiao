@@ -2375,7 +2375,7 @@ class StockFilter:
                 hot_industries,
                 lookback_days=lookback_days,
             )
-            if score_info["score"] >= 50:
+            if score_info is not None and score_info["score"] >= 50:
                 candidates.append(score_info)
             if progress_callback:
                 progress_callback(idx + 1, total, f"五日承接 {rec['code']} {rec.get('name', '')}")
@@ -2389,8 +2389,15 @@ class StockFilter:
         hot_industries: Dict[str, int],
         *,
         lookback_days: int = 5,
-    ) -> Dict[str, Any]:
-        """对"近期爆量后回落到 MA5 附近"的股票评分。"""
+    ) -> Optional[Dict[str, Any]]:
+        """对"近期爆量后回落到 MA5 附近"的股票评分。
+
+        硬性过滤（缺一不返回）：
+        1. 必须出现近期爆量（量比 ≥ 1.8x）
+        2. 当前价格离 MA5 ≤ ±3%（真正贴近 MA5）
+        3. 当日涨幅 ∈ [-5%, +6%)（避免大跌或抢跑，>6% 让首板/趋势处理）
+        4. 距爆量日 ≤ 7 个交易日（信号还有效）
+        """
         code = rec["code"]
         name = rec.get("name", "")
         change_pct = rec.get("change_pct")
@@ -2422,7 +2429,6 @@ class StockFilter:
         touched_ma5 = False
         recent_above_ma5 = False
         trend_ok = False
-        pullback_day = False
 
         if history is not None and not history.empty and len(history) >= 10:
             df = history.sort_values("date").reset_index(drop=True)
@@ -2482,8 +2488,6 @@ class StockFilter:
             if t >= 10 and not pd.isna(close.iloc[t - 10]) and close.iloc[t - 10] > 0 and latest_close is not None:
                 trend_10d = round((latest_close / float(close.iloc[t - 10]) - 1) * 100, 1)
 
-            if prev_close is not None and latest_close is not None:
-                pullback_day = latest_close <= prev_close
             if ma5_val is not None and ma10_val is not None:
                 trend_ok = ma5_val >= ma10_val or (latest_close is not None and latest_close >= ma10_val)
 
@@ -2495,96 +2499,113 @@ class StockFilter:
                             recent_above_ma5 = True
                             break
 
-        # 1. 先看最近几天是否出现过爆量
-        if recent_burst_ratio is not None:
-            if recent_burst_ratio >= 2.5:
-                score += 28
-                reasons.append(f"近期爆量{recent_burst_ratio:.1f}x+28")
-            elif recent_burst_ratio >= 1.8:
-                score += 18
-                reasons.append(f"近期放量{recent_burst_ratio:.1f}x+18")
-            elif recent_burst_ratio >= 1.5:
-                score += 8
-                reasons.append(f"近期量能活跃{recent_burst_ratio:.1f}x+8")
-            else:
-                score -= 12
-                reasons.append(f"近期无明显爆量{recent_burst_ratio:.1f}x-12")
+        # ---- 硬性过滤：不满足"五日承接"形态的票直接淘汰 ----
+        if recent_burst_ratio is None or recent_burst_ratio < 1.8:
+            return None
+        if dist_ma5_pct is None or not (-3.0 <= dist_ma5_pct <= 3.0):
+            return None
+        if change_pct is None or change_pct < -5.0 or change_pct >= 6.0:
+            return None
+        if days_since_burst is None or days_since_burst > 7:
+            return None
+
+        # 1. 爆量强度（max 22）
+        if recent_burst_ratio >= 5.0:
+            score += 22
+            reasons.append(f"爆量{recent_burst_ratio:.1f}x+22")
+        elif recent_burst_ratio >= 3.5:
+            score += 18
+            reasons.append(f"爆量{recent_burst_ratio:.1f}x+18")
+        elif recent_burst_ratio >= 2.5:
+            score += 12
+            reasons.append(f"放量{recent_burst_ratio:.1f}x+12")
         else:
-            reasons.append("近几日量能数据不足")
+            score += 6
+            reasons.append(f"温和放量{recent_burst_ratio:.1f}x+6")
 
-        if recent_burst_amount_ratio is not None and recent_burst_amount_ratio >= 2.0:
+        if recent_burst_amount_ratio is not None and recent_burst_amount_ratio >= 2.5:
+            score += 4
+            reasons.append(f"额比{recent_burst_amount_ratio:.1f}x+4")
+
+        # 2. 距爆量天数（max 12）
+        if 1 <= days_since_burst <= 2:
+            score += 12
+            reasons.append(f"爆量后{days_since_burst}日回踩+12")
+        elif days_since_burst == 3:
             score += 8
-            reasons.append(f"近期额比{recent_burst_amount_ratio:.1f}x+8")
+            reasons.append(f"爆量后3日回踩+8")
+        elif 4 <= days_since_burst <= 5:
+            score += 4
+            reasons.append(f"爆量后{days_since_burst}日回踩+4")
+        else:
+            score -= 5
+            reasons.append(f"距爆量{days_since_burst}日偏久-5")
 
-        if days_since_burst is not None:
-            if 1 <= days_since_burst <= 3:
-                score += 12
-                reasons.append(f"爆量后{days_since_burst}日回踩+12")
-            elif 4 <= days_since_burst <= 5:
-                score += 6
-                reasons.append(f"爆量后{days_since_burst}日回踩+6")
-            elif days_since_burst >= 6:
-                score -= 5
-                reasons.append(f"距爆量已{days_since_burst}日-5")
-
-        # 2. 当日价格回落而非继续冲高
-        if change_pct is not None:
-            if -4.0 <= change_pct <= 1.5:
-                score += 20
-                reasons.append(f"当日回落{change_pct:.1f}%+20")
-            elif 1.5 < change_pct <= 3.5:
-                score += 8
-                reasons.append(f"回落不深{change_pct:.1f}%+8")
-            elif change_pct < -6.0:
-                score -= 15
-                reasons.append(f"回落过深{change_pct:.1f}%-15")
-        if pullback_day:
-            score += 8
-            reasons.append("收盘低于昨收+8")
-
-        # 3. 靠近 MA5 才叫五日承接
-        if dist_ma5_pct is not None:
-            if -1.5 <= dist_ma5_pct <= 1.0:
-                score += 25
-                reasons.append(f"贴近MA5 {dist_ma5_pct:+.1f}%+25")
-            elif -3.0 <= dist_ma5_pct <= 2.0:
-                score += 12
-                reasons.append(f"靠近MA5 {dist_ma5_pct:+.1f}%+12")
-            elif dist_ma5_pct < -4.0:
-                score -= 12
-                reasons.append(f"跌破MA5过深{dist_ma5_pct:+.1f}%-12")
-            elif dist_ma5_pct > 4.0:
-                score -= 8
-                reasons.append(f"离MA5过远{dist_ma5_pct:+.1f}%-8")
+        # 3. 距 MA5（max 18，区间收紧）
+        if abs(dist_ma5_pct) <= 0.6:
+            score += 18
+            reasons.append(f"紧贴MA5 {dist_ma5_pct:+.1f}%+18")
+        elif abs(dist_ma5_pct) <= 1.5:
+            score += 12
+            reasons.append(f"贴近MA5 {dist_ma5_pct:+.1f}%+12")
+        else:
+            score += 4
+            reasons.append(f"靠近MA5 {dist_ma5_pct:+.1f}%+4")
 
         if touched_ma5:
-            score += 10
-            reasons.append("日内触及MA5+10")
+            score += 4
+            reasons.append("日内触及MA5+4")
 
-        # 4. 前面最好本来就在 MA5 上方，说明是强势回踩不是纯下跌
+        # 4. 当日表现（max 12）
+        if -2.0 <= change_pct <= 1.0:
+            score += 12
+            reasons.append(f"当日小幅回踩{change_pct:+.1f}%+12")
+        elif 1.0 < change_pct <= 3.0:
+            score += 6
+            reasons.append(f"当日小阳{change_pct:+.1f}%+6")
+        elif -4.0 <= change_pct < -2.0:
+            score += 4
+            reasons.append(f"当日深回踩{change_pct:+.1f}%+4")
+        elif 3.0 < change_pct < 6.0:
+            score -= 6
+            reasons.append(f"当日已抢跑{change_pct:+.1f}%-6")
+        elif change_pct < -4.0:
+            score -= 8
+            reasons.append(f"当日深跌{change_pct:+.1f}%-8")
+
+        # 5. 趋势配合（max 10）
         if recent_above_ma5:
-            score += 8
-            reasons.append("前几日曾强于MA5+8")
+            score += 4
+            reasons.append("前几日曾强于MA5+4")
         if trend_ok:
-            score += 8
-            reasons.append("趋势未坏+8")
-        elif dist_ma5_pct is not None and dist_ma5_pct < 0:
+            score += 4
+            reasons.append("趋势未坏+4")
+        elif dist_ma5_pct < 0:
             score -= 6
             reasons.append("回落时趋势偏弱-6")
 
         if trend_10d is not None:
             if 5 <= trend_10d <= 25:
-                score += 6
-                reasons.append(f"10日仍强{trend_10d:.1f}%+6")
+                score += 4
+                reasons.append(f"10日仍强{trend_10d:.1f}%+4")
             elif trend_10d < -5:
                 score -= 6
                 reasons.append(f"10日转弱{trend_10d:.1f}%-6")
 
-        if change_pct is not None:
-            if change_pct > 6:
-                score -= 8
-                reasons.append(f"当日仍过强{change_pct:.1f}%-8")
+        # 6. 距涨停可达性（max 8）— 越接近涨停明日越容易封板
+        lu_threshold = self._limit_up_threshold_pct(code)
+        room_to_lu = lu_threshold - change_pct
+        if room_to_lu < 4.0:
+            score += 8
+            reasons.append(f"距涨停剩{room_to_lu:.1f}%可达+8")
+        elif room_to_lu < 6.0:
+            score += 5
+            reasons.append(f"距涨停剩{room_to_lu:.1f}%+5")
+        elif room_to_lu < 8.0:
+            score += 2
+            reasons.append(f"距涨停剩{room_to_lu:.1f}%+2")
 
+        # 7. 行业（max 10）
         if industry and hot_industries.get(industry, 0) >= 3:
             score += 10
             reasons.append(f"热门板块({hot_industries[industry]}只)+10")
@@ -2592,11 +2613,12 @@ class StockFilter:
             score += 5
             reasons.append(f"板块联动({hot_industries[industry]}只)+5")
 
+        # 8. 换手率（max 5）
         if turnover is not None:
-            if 3 <= turnover <= 20:
+            if 3 <= turnover <= 18:
                 score += 5
                 reasons.append(f"换手{turnover:.1f}%适中+5")
-            elif turnover > 35:
+            elif turnover > 30:
                 score -= 5
                 reasons.append(f"换手{turnover:.1f}%过高-5")
 
