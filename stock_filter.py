@@ -2080,7 +2080,7 @@ class StockFilter:
             self._log("涨停预测：阶段5 - 识别五日承接候选...")
 
         first_board_candidates = self._scan_followthrough_candidates_cached(
-            hot_industries, spot_df, zt_codes, progress_callback, lookback_days=lookback_days,
+            hot_industries, spot_df, zt_codes, compare_context, progress_callback, lookback_days=lookback_days,
         )
 
         # 阶段6：首板涨停候选（最近 N 日未涨停、今日量价启动）
@@ -2643,6 +2643,7 @@ class StockFilter:
         hot_industries: Dict[str, int],
         spot_df: Optional[pd.DataFrame],
         zt_codes: set,
+        compare_context: Dict[str, Any],
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         *,
         lookback_days: int = 5,
@@ -2671,6 +2672,7 @@ class StockFilter:
             score_info = self._score_followthrough_candidate(
                 rec,
                 hot_industries,
+                compare_context,
                 lookback_days=lookback_days,
             )
             if score_info is not None and score_info["score"] >= 50:
@@ -2685,6 +2687,7 @@ class StockFilter:
         self,
         rec: Dict[str, Any],
         hot_industries: Dict[str, int],
+        compare_context: Dict[str, Any],
         *,
         lookback_days: int = 5,
     ) -> Optional[Dict[str, Any]]:
