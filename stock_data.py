@@ -158,70 +158,20 @@ def _history_block_cooldown_sec() -> float:
     return env_float("ASHARE_SCAN_HISTORY_BLOCK_COOLDOWN_SEC", default=900.0, lo=60.0, hi=7200.0)
 
 
-_HISTORY_REQUEST_SEMAPHORE = threading.BoundedSemaphore(_history_request_concurrency())
-_HISTORY_REQUEST_RATE_LOCK = threading.Lock()
-_HISTORY_NEXT_REQUEST_AT = 0.0
+from src.sources.eastmoney import throttling as _em_throttling
+_HISTORY_REQUEST_SEMAPHORE = _em_throttling.REQUEST_SEMAPHORE
+_HISTORY_REQUEST_RATE_LOCK = _em_throttling.REQUEST_RATE_LOCK
 
 # ---- 自适应请求间隔 ----
-# 连续成功时逐步缩短间隔（加速），遇到限流时立即放大间隔（减速）。
-_ADAPTIVE_INTERVAL_LOCK = threading.Lock()
-_ADAPTIVE_INTERVAL_SEC = _history_min_request_interval_sec()  # 当前自适应间隔
-_ADAPTIVE_SUCCESS_STREAK = 0  # 连续成功计数
-_ADAPTIVE_MIN_INTERVAL = 1.0   # 自适应下限（秒）—— 太低容易触发封禁
-_ADAPTIVE_MAX_INTERVAL = 15.0  # 自适应上限（秒）
-_ADAPTIVE_RATE_LIMIT_COUNT = 0  # 限流累计次数（用于渐进式惩罚）
+# 实现已迁移到 src/sources/eastmoney/throttling.py
+_adaptive_on_success = _em_throttling.adaptive_on_success
+_adaptive_on_rate_limit = _em_throttling.adaptive_on_rate_limit
+_adaptive_current_interval = _em_throttling.adaptive_current_interval
 
-
-def _adaptive_on_success() -> None:
-    """网络请求成功后调用，逐步缩短间隔（保守策略）。"""
-    global _ADAPTIVE_INTERVAL_SEC, _ADAPTIVE_SUCCESS_STREAK
-    with _ADAPTIVE_INTERVAL_LOCK:
-        _ADAPTIVE_SUCCESS_STREAK += 1
-        # 每连续成功 20 次才缩短 5%，比之前更保守
-        if _ADAPTIVE_SUCCESS_STREAK % 20 == 0:
-            _ADAPTIVE_INTERVAL_SEC = max(
-                _ADAPTIVE_MIN_INTERVAL,
-                _ADAPTIVE_INTERVAL_SEC * 0.95,
-            )
-
-
-def _adaptive_on_rate_limit() -> None:
-    """遇到限流时调用，渐进式惩罚——每次限流惩罚更重。"""
-    global _ADAPTIVE_INTERVAL_SEC, _ADAPTIVE_SUCCESS_STREAK, _ADAPTIVE_RATE_LIMIT_COUNT
-    with _ADAPTIVE_INTERVAL_LOCK:
-        _ADAPTIVE_SUCCESS_STREAK = 0
-        _ADAPTIVE_RATE_LIMIT_COUNT += 1
-        # 首次限流：间隔翻倍；后续每次额外加 50%
-        multiplier = 2.0 + (_ADAPTIVE_RATE_LIMIT_COUNT - 1) * 0.5
-        _ADAPTIVE_INTERVAL_SEC = min(
-            _ADAPTIVE_MAX_INTERVAL,
-            _ADAPTIVE_INTERVAL_SEC * multiplier,
-        )
-
-
-def _adaptive_current_interval() -> float:
-    """获取当前自适应间隔。"""
-    with _ADAPTIVE_INTERVAL_LOCK:
-        return _ADAPTIVE_INTERVAL_SEC
-_HISTORY_DIAGNOSTICS_LOCK = threading.Lock()
-_HISTORY_DIAGNOSTICS: Dict[str, int] = {
-    "cache_hits": 0,
-    "network_requests": 0,
-    "network_success": 0,
-    "network_failures": 0,
-    "fallback_cache_returns": 0,
-    "rate_limit_events": 0,
-    "cooldown_skips": 0,
-    "probe_requests": 0,
-    "probe_success": 0,
-    "probe_failures": 0,
-    "probe_cache_hits": 0,
-}
-_EASTMONEY_HISTORY_MIRRORS = [
-    "https://push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://82.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://40.push2his.eastmoney.com/api/qt/stock/kline/get",
-]
+_HISTORY_DIAGNOSTICS_LOCK = _em_throttling._DIAGNOSTICS_LOCK
+_HISTORY_DIAGNOSTICS = _em_throttling.DIAGNOSTICS
+from src.sources.eastmoney import history as _em_history
+_EASTMONEY_HISTORY_MIRRORS = _em_history.HISTORY_MIRRORS
 # ---- 全局主机健康管理器 ----
 # 实现已迁移到 src/network/host_health.py；下面用别名保持调用方零修改。
 from src.network import host_health as _host_health
@@ -257,13 +207,15 @@ def _eastmoney_circuit_breaker_record_success() -> None:
 _global_filter_healthy_urls = _host_health.filter_healthy_urls
 
 
-_HISTORY_BLOCK_LOCK = threading.Lock()
-_HISTORY_BLOCKED_UNTIL = 0.0
-_HISTORY_BLOCK_EVENTS: List[float] = []
+_HISTORY_BLOCK_LOCK = _em_throttling._BLOCK_LOCK
 
 # 东方财富 / 通用 HTTP headers 实现已迁移到 src/network/headers.py。
 import random as _random
 from src.sources import _common as _sources_common
+from src.utils import codes as _utils_codes
+from src.utils import parsing as _utils_parsing
+from src.sources.eastmoney import numeric as _em_numeric
+
 from src.network.headers import (
     USER_AGENT_POOL as _USER_AGENT_POOL,
     REFERER_POOL as _REFERER_POOL,
@@ -287,22 +239,10 @@ from src.network.proxy_pool import (
 _list_download_log: Optional[Callable[[str], None]] = None
 
 
-class EastmoneyRateLimitError(RuntimeError):
-    pass
-
-
-class HistoryAccessSuspendedError(RuntimeError):
-    pass
-
-
-def _increment_history_diagnostic(key: str, step: int = 1) -> None:
-    with _HISTORY_DIAGNOSTICS_LOCK:
-        _HISTORY_DIAGNOSTICS[key] = int(_HISTORY_DIAGNOSTICS.get(key, 0)) + int(step)
-
-
-def _history_diagnostics_snapshot() -> Dict[str, int]:
-    with _HISTORY_DIAGNOSTICS_LOCK:
-        return {str(k): int(v) for k, v in _HISTORY_DIAGNOSTICS.items()}
+EastmoneyRateLimitError = _em_throttling.EastmoneyRateLimitError
+HistoryAccessSuspendedError = _em_throttling.HistoryAccessSuspendedError
+_increment_history_diagnostic = _em_throttling.increment_diagnostic
+_history_diagnostics_snapshot = _em_throttling.diagnostics_snapshot
 
 
 def _is_transient_network_error(exc: BaseException) -> bool:
@@ -345,115 +285,21 @@ def _history_retry_ak_call(fn: Callable[..., T], *args, **kwargs) -> T:
         return fn(*args, **kwargs)
 
 
-def _random_jsonp_callback() -> str:
-    """生成随机 JSONP 回调名，模拟东方财富网页的真实调用模式。"""
-    ts = int(time.time() * 1000)
-    rand = _random.randint(1000000, 9999999)
-    prefix = _random.choice(["jQuery", "jQuery1124", "jQuery35", "jQuery36"])
-    return f"{prefix}{rand}_{ts}"
+_history_access_blocked_until = _em_throttling.history_access_blocked_until
+_record_history_block = _em_throttling.record_history_block
+_wait_for_history_request_slot = _em_throttling.wait_for_history_request_slot
 
 
-def _eastmoney_history_request_params(stock_code: str, start_date: str, end_date: str) -> Dict[str, str]:
-    market_code = 1 if str(stock_code).startswith("6") else 0
-    params = {
-        "fields1": "f1,f2,f3,f4,f5,f6",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
-        "ut": "7eea3edcaed734bea9cbfc24409ed989",
-        "klt": "101",
-        "fqt": "0",
-        "secid": f"{market_code}.{stock_code}",
-        "beg": start_date,
-        "end": end_date,
-        "cb": _random_jsonp_callback(),
-        "_": str(int(time.time() * 1000)),
-    }
-    return params
+from src.sources._jsonp import random_callback as _random_jsonp_callback, strip_wrapper as _strip_jsonp_wrapper
+from src.sources.eastmoney import history_parser as _em_history_parser
 
 
-def _strip_jsonp_wrapper(text: str) -> str:
-    """剥离 JSONP 回调包装，提取内部 JSON。
-
-    例如 'jQuery123456_1234567890({...})' → '{...}'
-    """
-    s = text.strip()
-    if not s:
-        return s
-    # 查找第一个 '(' 和最后一个 ')'
-    lp = s.find("(")
-    rp = s.rfind(")")
-    if lp >= 0 and rp > lp:
-        inner = s[lp + 1 : rp].strip()
-        if inner:
-            return inner
-    return s
+_eastmoney_history_request_params = _em_history_parser.request_params
 
 
-def _request_session_get_json(url: str, params: Dict[str, Any], timeout: Tuple[int, int]) -> Dict[str, Any]:
-    import requests
-    import json as _json
-
-    _wait_for_history_request_slot()
-    _increment_history_diagnostic("network_requests")
-
-    proxy = _get_proxy()
-    with requests.Session() as session:
-        if proxy:
-            session.proxies = {"http": proxy, "https": proxy}
-        elif _use_bypass_proxy():
-            session.trust_env = False
-            session.proxies = {"http": None, "https": None}
-        # 每次请求使用随机化请求头，模拟真实浏览器行为
-        req_kw: Dict[str, Any] = {
-            "url": url,
-            "params": params,
-            "timeout": timeout,
-            "headers": _random_eastmoney_headers(),
-        }
-        if _use_insecure_ssl():
-            req_kw["verify"] = False
-        try:
-            response = session.get(**req_kw)
-        except Exception:
-            if proxy:
-                _blacklist_proxy(proxy)
-            raise
-        response_text = response.text or ""
-        if _looks_like_eastmoney_rate_limit(response.status_code, response_text):
-            _adaptive_on_rate_limit()
-            _increment_history_diagnostic("rate_limit_events")
-            _increment_history_diagnostic("network_failures")
-            message = _record_history_block(
-                f"东方财富返回 {response.status_code}，疑似触发限流或封禁"
-            )
-            raise EastmoneyRateLimitError(message)
-        response.raise_for_status()
-
-        # 处理 JSONP 包装：东方财富接口返回 callback({json}) 格式
-        raw_text = _strip_jsonp_wrapper(response_text)
-        try:
-            data_json = _json.loads(raw_text)
-        except ValueError:
-            # 回退：尝试直接 response.json()
-            try:
-                data_json = response.json()
-            except ValueError as exc:
-                if _looks_like_eastmoney_rate_limit(response.status_code, response_text):
-                    _adaptive_on_rate_limit()
-                    _increment_history_diagnostic("rate_limit_events")
-                    _increment_history_diagnostic("network_failures")
-                    message = _record_history_block("东方财富返回非 JSON 内容，疑似触发限流或封禁")
-                    raise EastmoneyRateLimitError(message) from exc
-                _increment_history_diagnostic("network_failures")
-                raise
-        if _eastmoney_json_indicates_rate_limit(data_json):
-            _adaptive_on_rate_limit()
-            _increment_history_diagnostic("rate_limit_events")
-            _increment_history_diagnostic("network_failures")
-            message = _record_history_block("东方财富返回限流提示，进入冷却保护")
-            raise EastmoneyRateLimitError(message)
-        _adaptive_on_success()
-        _increment_history_diagnostic("network_success")
-        return data_json
+# 核心 GET 包装：实现已迁移到 src/sources/eastmoney/session.py
+from src.sources.eastmoney import session as _em_session
+_request_session_get_json = _em_session.get_json
 
 
 # 东财 intraday + auction snapshot 实现已迁移到 src/sources/eastmoney/intraday.py
@@ -473,57 +319,6 @@ _looks_like_eastmoney_rate_limit = _em_rate_limit.looks_like_rate_limit
 _eastmoney_json_indicates_rate_limit = _em_rate_limit.json_indicates_rate_limit
 
 
-def _history_access_blocked_until() -> float:
-    now = time.time()
-    with _HISTORY_BLOCK_LOCK:
-        global _HISTORY_BLOCKED_UNTIL
-        if _HISTORY_BLOCKED_UNTIL <= now:
-            _HISTORY_BLOCKED_UNTIL = 0.0
-            _HISTORY_BLOCK_EVENTS.clear()
-            return 0.0
-        return _HISTORY_BLOCKED_UNTIL
-
-
-def _record_history_block(reason: str) -> str:
-    now = time.time()
-    window_start = now - _history_block_window_sec()
-    with _HISTORY_BLOCK_LOCK:
-        global _HISTORY_BLOCKED_UNTIL
-        _HISTORY_BLOCK_EVENTS[:] = [ts for ts in _HISTORY_BLOCK_EVENTS if ts >= window_start]
-        _HISTORY_BLOCK_EVENTS.append(now)
-        if len(_HISTORY_BLOCK_EVENTS) >= _history_block_threshold():
-            _HISTORY_BLOCKED_UNTIL = max(_HISTORY_BLOCKED_UNTIL, now + _history_block_cooldown_sec())
-        blocked_until = _HISTORY_BLOCKED_UNTIL
-    if blocked_until > now:
-        remain = max(1, int(blocked_until - now))
-        return f"{reason}；已暂停新的东方财富历史请求，约 {remain}s 后再试"
-    return reason
-
-
-def _wait_for_history_request_slot() -> None:
-    # 使用自适应间隔：连续成功则加速，遇到限流则减速
-    min_interval = _adaptive_current_interval()
-    # 加随机抖动 ±30%，避免请求间隔过于规律被识别为机器行为
-    jitter = min_interval * _random.uniform(-0.3, 0.3)
-    actual_interval = max(0.5, min_interval + jitter)
-    while True:
-        blocked_until = _history_access_blocked_until()
-        now = time.time()
-        if blocked_until > now:
-            remain = max(1, int(blocked_until - now))
-            _increment_history_diagnostic("cooldown_skips")
-            raise HistoryAccessSuspendedError(
-                f"东方财富历史接口正在冷却保护中，约 {remain}s 后恢复"
-            )
-        with _HISTORY_REQUEST_RATE_LOCK:
-            global _HISTORY_NEXT_REQUEST_AT
-            wait_sec = _HISTORY_NEXT_REQUEST_AT - now
-            if wait_sec <= 0:
-                _HISTORY_NEXT_REQUEST_AT = now + actual_interval
-                return
-        time.sleep(min(wait_sec, 0.5))
-
-
 # Mirror 包装：实现已迁移到 src/sources/eastmoney/rate_limit.py + src/network/host_health.py
 _history_mirror_host = _em_rate_limit.mirror_host_of
 _mark_history_mirror_failed = _host_health.mark_failed
@@ -531,84 +326,19 @@ _mark_history_mirror_ok = _host_health.mark_ok
 _history_mirror_on_cooldown = _host_health.on_cooldown
 
 
+from src.sources.eastmoney import mirrors as _em_mirrors
+
+
 def _prioritize_history_mirrors(
-    mirror_urls: List[str],
-    preferred_mirror: Optional[str] = None,
-) -> List[str]:
-    now = time.time()
-    seen: set[str] = set()
-
-    candidates = []
-    if preferred_mirror:
-        candidates.append(preferred_mirror)
-    candidates.extend(mirror_urls)
-
-    healthy: List[str] = []
-    cooling: List[str] = []
-    for url in candidates:
-        clean = str(url or "").strip()
-        if not clean or clean in seen:
-            continue
-        seen.add(clean)
-        if _history_mirror_on_cooldown(clean, now):
-            cooling.append(clean)
-        else:
-            healthy.append(clean)
-
-    # 冷却中的镜像直接剔除，避免“明知不可用还继续打”。
-    return healthy[: _history_max_mirrors_per_stock()]
+    mirror_urls,
+    preferred_mirror=None,
+):
+    return _em_mirrors.prioritize_history_mirrors(
+        mirror_urls, preferred_mirror, max_count=_history_max_mirrors_per_stock()
+    )
 
 
-def _parse_eastmoney_hist_json(stock_code: str, data_json: Dict[str, Any]) -> "pd.DataFrame":
-    klines = (data_json.get("data") or {}).get("klines") or []
-    if not klines:
-        return pd.DataFrame()
-    temp_df = pd.DataFrame([item.split(",") for item in klines])
-    temp_df["股票代码"] = str(stock_code).strip().zfill(6)
-    temp_df.columns = [
-        "日期",
-        "开盘",
-        "收盘",
-        "最高",
-        "最低",
-        "成交量",
-        "成交额",
-        "振幅",
-        "涨跌幅",
-        "涨跌额",
-        "换手率",
-        "股票代码",
-    ]
-    temp_df["日期"] = pd.to_datetime(temp_df["日期"], errors="coerce").dt.date
-    for col in [
-        "开盘",
-        "收盘",
-        "最高",
-        "最低",
-        "成交量",
-        "成交额",
-        "振幅",
-        "涨跌幅",
-        "涨跌额",
-        "换手率",
-    ]:
-        temp_df[col] = pd.to_numeric(temp_df[col], errors="coerce")
-    return temp_df[
-        [
-            "日期",
-            "股票代码",
-            "开盘",
-            "收盘",
-            "最高",
-            "最低",
-            "成交量",
-            "成交额",
-            "振幅",
-            "涨跌幅",
-            "涨跌额",
-            "换手率",
-        ]
-    ]
+_parse_eastmoney_hist_json = _em_history_parser.parse_hist_json
 
 
 _normalize_history_frame = _sources_common.normalize_history_frame
@@ -659,185 +389,17 @@ from src.sources import wscn as _src_wscn
 _fetch_wscn_hist_frame = _src_wscn.fetch_hist_frame
 
 
-def _probe_history_mirror(url: str) -> Tuple[bool, str]:
-    probe_code = "000001"
-    end_date = datetime.now().strftime("%Y%m%d")
-    start_date = (datetime.now() - timedelta(days=40)).strftime("%Y%m%d")
-    params = _eastmoney_history_request_params(probe_code, start_date, end_date)
-    _increment_history_diagnostic("probe_requests")
-    try:
-        data_json = _request_session_get_json(
-            url,
-            params=params,
-            timeout=(_history_connect_timeout_sec(), _history_read_timeout_sec()),
-        )
-        df = _parse_eastmoney_hist_json(probe_code, data_json)
-        if df.empty:
-            _mark_history_mirror_failed(url)
-            return False, "empty"
-        latest_series = df["日期"].dropna()
-        latest_date = str(latest_series.iloc[-1]) if not latest_series.empty else "unknown"
-        _mark_history_mirror_ok(url)
-        _increment_history_diagnostic("probe_success")
-        return True, latest_date
-    except HistoryAccessSuspendedError as e:
-        _mark_history_mirror_failed(url)
-        _increment_history_diagnostic("probe_failures")
-        return False, str(e)
-    except EastmoneyRateLimitError as e:
-        _mark_history_mirror_failed(url)
-        _increment_history_diagnostic("probe_failures")
-        return False, str(e)
-    except Exception as e:
-        _mark_history_mirror_failed(url)
-        _increment_history_diagnostic("probe_failures")
-        return False, str(e)
+# 历史抓取主函数 + probe：实现已迁移到 src/sources/eastmoney/history.py
+_probe_history_mirror = _em_history.probe_mirror
+_fetch_eastmoney_hist_frame = _em_history.fetch_hist_frame
 
 
-def _fetch_eastmoney_hist_frame(
-    stock_code: str,
-    days: int,
-    start_date: str,
-    end_date: str,
-    mirror_urls: Optional[List[str]] = None,
-    log: Optional[Callable[[str], None]] = None,
-) -> "pd.DataFrame":
-    """直接抓东方财富历史日线，并在多个镜像间轮换。"""
-    params = _eastmoney_history_request_params(stock_code, start_date, end_date)
-    mirrors = list(mirror_urls or _EASTMONEY_HISTORY_MIRRORS)
-    last_exception: Optional[BaseException] = None
-    deadline = time.time() + _history_total_timeout_sec()
+# AkShare 警告抑制实现已迁移到 src/sources/eastmoney/akshare_warnings.py
+# import 时即注册全局 filterwarnings，无需在此重复。
+from src.sources.eastmoney import akshare_warnings as _ak_warnings
+_AkshareWarningCategory = _ak_warnings.AkshareWarningCategory
+_call_akshare_quietly = _ak_warnings.call_quietly
 
-    for base_url in mirrors:
-        host = _history_mirror_host(base_url)
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            break
-        try:
-            connect_timeout = min(_history_connect_timeout_sec(), max(0.5, remaining))
-            read_timeout = min(_history_read_timeout_sec(), max(1.0, remaining))
-            data_json = _request_session_get_json(
-                base_url,
-                params=params,
-                timeout=(connect_timeout, read_timeout),
-            )
-            df = _parse_eastmoney_hist_json(stock_code, data_json)
-            if df.empty:
-                err = RuntimeError(f"{host} 返回空历史数据")
-                last_exception = err
-                _mark_history_mirror_failed(base_url)
-                if log:
-                    log(f"历史 {stock_code} 镜像 {host} 返回空数据，切换下一个镜像。")
-                continue
-            _mark_history_mirror_ok(base_url)
-            return df
-        except HistoryAccessSuspendedError as e:
-            last_exception = e
-            if log:
-                log(f"历史 {stock_code} 暂停访问东方财富：{e}")
-            break
-        except EastmoneyRateLimitError as e:
-            last_exception = e
-            _mark_history_mirror_failed(base_url)
-            if log:
-                log(f"历史 {stock_code} 触发东方财富限流保护：{e}")
-            break
-        except Exception as e:
-            last_exception = e
-            _mark_history_mirror_failed(base_url)
-            if log:
-                log(f"历史 {stock_code} 镜像 {host} 失败: {e}，切换下一个镜像。")
-    if last_exception is not None:
-        raise last_exception
-    return pd.DataFrame()
-
-
-try:
-    from pandas.errors import SettingWithCopyWarning as _AkshareWarningCategory
-except ImportError:
-    try:
-        from pandas.errors import ChainedAssignmentError as _AkshareWarningCategory
-    except ImportError:
-        _AkshareWarningCategory = Warning
-
-warnings.filterwarnings(
-    "ignore",
-    category=_AkshareWarningCategory,
-    module=r"akshare\.stock\.stock_board_concept_em",
-)
-
-
-def _call_akshare_quietly(fn: Callable[..., T], *args, **kwargs) -> T:
-    # AkShare's concept-board helpers emit noisy SettingWithCopyWarning logs
-    # even when the returned data is usable. Silence only that warning locally.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", _AkshareWarningCategory)
-        return _retry_ak_call(fn, *args, **kwargs)
-
-
-_first_existing_column = _sources_common.first_existing_column
-
-
-def _find_fund_flow_column(columns: List[str], includes: List[str], excludes: Optional[List[str]] = None) -> Optional[str]:
-    exclude_tokens = [str(x).strip() for x in (excludes or []) if str(x).strip()]
-    for col in columns:
-        text = str(col).strip()
-        if not text:
-            continue
-        if all(token in text for token in includes):
-            if any(token in text for token in exclude_tokens):
-                continue
-            return col
-    return None
-
-
-def _parse_cn_numeric(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        try:
-            return float(value)
-        except Exception:
-            return None
-    text = str(value).strip().replace(",", "")
-    if not text or text.lower() == "nan":
-        return None
-    multiplier = 1.0
-    if text.endswith("%"):
-        text = text[:-1]
-    if text.endswith("亿"):
-        multiplier = 1e8
-        text = text[:-1]
-    elif text.endswith("万"):
-        multiplier = 1e4
-        text = text[:-1]
-    try:
-        return float(text) * multiplier
-    except Exception:
-        return None
-
-
-def _fetch_ths_fund_flow_frame(stock_code: str):
-    fn = getattr(ak, "stock_individual_fund_flow_ths", None)
-    if fn is None:
-        raise RuntimeError(
-            "同花顺无按股票代码的个股资金流历史接口（stock_fund_flow_individual 仅返回全市场排行），"
-            "请改用东方财富源"
-        )
-    last_error: Optional[Exception] = None
-    for kwargs in ({"stock": stock_code}, {"symbol": stock_code}):
-        try:
-            df = _retry_ak_call(fn, **kwargs)
-            if df is not None and not getattr(df, "empty", True):
-                return df
-        except TypeError as exc:
-            last_error = exc
-            continue
-        except Exception as exc:
-            raise exc
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("ths-fund-flow-empty")
 
 def clear_universe_data() -> None:
     """清空已保存的股票池和扫描快照。"""
@@ -850,521 +412,70 @@ def clear_history_data() -> None:
     clear_history_store()
 
 
-def _save_universe_store(
-    df: pd.DataFrame, log: Optional[Callable[[str], None]] = None
-) -> None:
-    if df.empty or "code" not in df.columns:
-        return
-    save_universe_store(df)
-    if log:
-        log(f"股票池已保存 {len(df)} 只 → data/stock_store.sqlite3")
+# Store 包装层：实现已迁移到 src/services/store_facade.py
+from src.services import store_facade as _store_facade
+_save_universe_store = _store_facade.save_universe
+_load_universe_store = _store_facade.load_universe
+_load_history_store = _store_facade.load_history
+_save_history_store = _store_facade.save_history
+_load_fund_flow_store = _store_facade.load_fund_flow
+_save_fund_flow_store = _store_facade.save_fund_flow
 
 
-def _load_universe_store(
-    log: Optional[Callable[[str], None]] = None,
-) -> Optional[pd.DataFrame]:
-    df = load_universe_store()
-    if df is None or df.empty:
-        return None
-    if "name" not in df.columns:
-        df["name"] = ""
-    if "exchange" not in df.columns:
-        df["exchange"] = df["code"].map(_infer_exchange)
-    if "board" not in df.columns:
-        df["board"] = df["code"].map(
-            lambda x: "???"
-            if str(x).strip().zfill(6).startswith("688")
-            else _infer_sz_board(x)
-        )
-    if "concepts" not in df.columns:
-        df["concepts"] = ""
-    df["code"] = (
-        df["code"]
-        .astype(str)
-        .str.replace(r"\.0$", "", regex=True)
-        .str.strip()
-        .str.zfill(6)
-    )
-    df["concepts"] = df["concepts"].astype(str).map(_normalize_concepts_text)
-    if log:
-        log(f"已从 data/stock_store.sqlite3 读取股票池 {len(df)} 只")
-    return df[["code", "name", "exchange", "board", "concepts"]]
+_eastmoney_request_mirror_urls = _em_mirrors.request_mirror_urls
 
 
-def _load_history_store(
-    stock_code: str,
-    min_rows: int,
-    end_date: str,
-    log: Optional[Callable[[str], None]] = None,
-) -> Optional[pd.DataFrame]:
-    df = load_history_store(stock_code)
-    if df is None or df.empty or "date" not in df.columns or "close" not in df.columns:
-        return None
-    df["date"] = df["date"].astype(str).str.strip()
-    df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
-    if len(df) < min_rows:
-        return None
-    if log:
-        log(f"已从 data/stock_store.sqlite3 读取历史 {stock_code} {len(df)} 行")
-    return df
-
-
-def _save_history_store(stock_code: str, df: pd.DataFrame, keep_rows: int = 0) -> None:
-    """保存历史数据到本地 SQLite。
-    keep_rows=0 表示保存全部行（企业级策略：不截断，保证任意天数查询都能命中缓存）。
-    保存前会做 OHLC 数据校验，有异常记录到日志但不阻止保存。
-    """
-    if df is None or df.empty:
-        return
-    if "date" not in df.columns:
-        return
-    out = df.copy()
-    out["date"] = out["date"].astype(str).str.strip()
-    out = out.sort_values("date").reset_index(drop=True)
-    if keep_rows > 0:
-        out = out.tail(max(keep_rows, 10)).reset_index(drop=True)
-
-    # 数据校验（只记日志不阻止保存）
-    try:
-        from stock_validator import validate_ohlc, validate_change_pct
-        ohlc_issues = validate_ohlc(out, stock_code)
-        pct_issues = validate_change_pct(out, stock_code=stock_code)
-        if ohlc_issues:
-            logger.warning("%s 保存前检测到 %d 条 OHLC 异常", stock_code, len(ohlc_issues))
-        if pct_issues:
-            logger.warning("%s 保存前检测到 %d 条涨跌幅异常", stock_code, len(pct_issues))
-    except Exception:
-        pass
-
-    save_history_store(stock_code, out)
-
-
-def _load_fund_flow_store(
-    stock_code: str,
-    min_rows: int,
-    log: Optional[Callable[[str], None]] = None,
-) -> Optional[pd.DataFrame]:
-    df = load_fund_flow_store(stock_code)
-    if df is None or df.empty or "date" not in df.columns:
-        return None
-    df["date"] = df["date"].astype(str).str.strip()
-    df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-    if len(df) < min_rows:
-        return None
-    if log:
-        log(f"已从 data/stock_store.sqlite3 读取资金流 {stock_code} {len(df)} 行")
-    return df
-
-
-def _save_fund_flow_store(stock_code: str, df: pd.DataFrame, keep_rows: int = 40) -> None:
-    if df is None or df.empty or "date" not in df.columns:
-        return
-    out = df.copy()
-    out["date"] = out["date"].astype(str).str.strip()
-    out = out.sort_values("date").tail(max(keep_rows, 10)).reset_index(drop=True)
-    save_fund_flow_store(stock_code, out)
-
-
-def _eastmoney_request_mirror_urls(url: str) -> List[str]:
-    """东方财富 push 多节点；82 等单线路易在分页中途被断开，优先尝试无编号主域。"""
-    from urllib.parse import urlparse, urlunparse
-
-    raw = url.strip()
-    p = urlparse(raw)
-    netloc = (p.netloc or "").lower()
-    if "eastmoney.com" not in netloc:
-        return [raw]
-    path = p.path or "/"
-    original = p.netloc
-    hosts = [
-        "push2.eastmoney.com",
-        original,
-        "82.push2.eastmoney.com",
-        "40.push2.eastmoney.com",
-    ]
-    seen: set[str] = set()
-    out: List[str] = []
-    for host in hosts:
-        h = (host or "").strip()
-        if not h:
-            continue
-        key = h.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(urlunparse(("https", h, path, "", "", "")))
-    return out if out else [raw]
-
-
-def _ashare_request_with_retry(
-    url: str,
-    params: Optional[Dict[str, Any]] = None,
-    timeout: int = 15,
-    max_retries: int = 3,
-    base_delay: float = 1.0,
-    random_delay_range: Tuple[float, float] = (0.3, 1.0),
-):
-    """
-    替换 akshare 内置 request_with_retry：显式浏览器头、多镜像、更长超时。
-    原实现通过 `from ... import request_with_retry` 绑定，必须同时 patch utils.func。
-
-    优化：增加 total deadline（所有镜像+重试合计不超过 20s），防止东财不可达时无限阻塞。
-    """
-    import random
-
-    import requests
-    from requests.adapters import HTTPAdapter
-
-    _TOTAL_DEADLINE_SEC = 20.0  # 所有镜像 + 重试的绝对截止时间
-    deadline = time.time() + _TOTAL_DEADLINE_SEC
-
-    params = params or {}
-    if "eastmoney.com" in url:
-        timeout = max(int(timeout or 0), 10)
-
-    # 熔断：如果东财全局处于冷却期，直接快速失败
-    if "eastmoney.com" in url and _eastmoney_circuit_breaker_open():
-        raise RequestsConnectionError(
-            "东方财富接口熔断中（连续失败过多），跳过本次请求"
-        )
-
-    last_exception: Optional[BaseException] = None
-
-    mirrors = _eastmoney_request_mirror_urls(url)
-    for mi, base_url in enumerate(mirrors):
-        for attempt in range(max_retries):
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                if last_exception is None:
-                    last_exception = RequestsTimeout(
-                        f"request_with_retry 总时限 {_TOTAL_DEADLINE_SEC:.0f}s 已到"
-                    )
-                raise last_exception
-
-            lg = _list_download_log
-            if (
-                lg
-                and attempt == 0
-                and mi == 0
-                and "/api/qt/clist/get" in url
-                and isinstance(params, dict)
-            ):
-                pn = params.get("pn", "?")
-                lg(
-                    f"列表分页：正在请求第 {pn} 页（共 {len(mirrors)} 个镜像可轮换）…"
-                )
-            try:
-                per_req_timeout = min(timeout, max(2, remaining))
-                with requests.Session() as session:
-                    if _use_bypass_proxy():
-                        session.trust_env = False
-                    adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1)
-                    session.mount("http://", adapter)
-                    session.mount("https://", adapter)
-                    hdrs = _random_eastmoney_headers()
-                    req_kw: Dict[str, Any] = {
-                        "url": base_url,
-                        "params": params,
-                        "timeout": per_req_timeout,
-                        "headers": hdrs,
-                    }
-                    if _use_insecure_ssl():
-                        req_kw["verify"] = False
-                    response = session.get(**req_kw)
-                    response.raise_for_status()
-                    # 成功：重置熔断计数
-                    if "eastmoney.com" in url:
-                        _eastmoney_circuit_breaker_record_success()
-                    return response
-            except (requests.RequestException, ValueError) as e:
-                last_exception = e
-                if "eastmoney.com" in url:
-                    _eastmoney_circuit_breaker_record_failure()
-                if attempt < max_retries - 1 and (deadline - time.time()) > 1:
-                    delay = min(
-                        base_delay * (1.5 ** attempt) + random.uniform(*random_delay_range),
-                        max(0.5, deadline - time.time() - 1),
-                    )
-                    time.sleep(delay)
-    if last_exception is not None:
-        raise last_exception
-    raise RuntimeError("request_with_retry: no attempt made")
-
-
-def _patch_akshare_request_layer() -> None:
-    import akshare.utils.func as ak_func
-    import akshare.utils.request as ak_req
-
-    ak_req.request_with_retry = _ashare_request_with_retry
-    ak_func.request_with_retry = _ashare_request_with_retry
-
-
+# AkShare request_with_retry patch：实现已迁移到 src/sources/eastmoney/akshare_patch.py
+from src.sources.eastmoney import akshare_patch as _ak_patch
+_ashare_request_with_retry = _ak_patch.request_with_retry
+_patch_akshare_request_layer = _ak_patch.apply
 _patch_akshare_request_layer()
 
 
-def _use_em_full_spot_for_list() -> bool:
-    """设为 1 / em / eastmoney 时仍走东方财富分页全表（易卡死，不推荐）。"""
-    return os.environ.get("ASHARE_SCAN_LIST_SOURCE", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "em",
-        "eastmoney",
-        "efull",
-    )
+from src.sources import universe as _src_universe
+_use_em_full_spot_for_list = _src_universe.use_em_full_spot_for_list
 
 
-def _em_scalar(x: Any) -> float:
-    if x is None or x == "-":
-        return 0.0
-    try:
-        if isinstance(x, float) and pd.isna(x):
-            return 0.0
-    except Exception:
-        pass
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return 0.0
+_em_scalar = _em_numeric.em_scalar
 
 
-def _em_price_yuan(x: Any) -> float:
-    """东财 stock/get 行情价字段多为整数，常见为「元×1000」。
-    阈值用 10000 以避免误伤高价股（如贵州茅台 ~1500 元）。
-    """
-    v = _em_scalar(x)
-    if v == 0.0:
-        return 0.0
-    if abs(v) >= 10000:
-        return v / 1000.0
-    return v
+_em_price_yuan = _em_numeric.em_price_yuan
 
 
-def _norm_code_series(s: pd.Series) -> pd.Series:
-    return (
-        s.astype(str)
-        .str.replace(r"\.0$", "", regex=True)
-        .str.strip()
-        .str.zfill(6)
-    )
+_norm_code_series = _utils_codes.norm_code_series
 
 
-def _norm_code(code: Any) -> str:
-    s = str(code).strip()
-    if not s or s.lower() == "nan":
-        return ""
-    return re.sub(r"\.0$", "", s).strip().zfill(6)
+_norm_code = _utils_codes.norm_code
 
 
-def _infer_sz_board(code: str) -> str:
-    c = str(code).strip().zfill(6)
-    if c.startswith(("300", "301")):
-        return "创业板"
-    if c.startswith(("000", "001", "002", "003")):
-        return "深交所主板"
-    return "深交所A股"
+_infer_sz_board = _utils_codes.infer_sz_board
 
 
-def _infer_exchange(code: str) -> str:
-    c = str(code).strip().zfill(6)
-    return "上交所" if c.startswith(("5", "6", "9")) else "深交所"
+_infer_exchange = _utils_codes.infer_exchange
 
 
 _infer_market = _sources_common.infer_market
 _market_prefixed_code = _sources_common.market_prefixed_code
 
 
-def _normalize_concepts_text(value: Any) -> str:
-    text = str(value or "").strip()
-    if not text or text.lower() == "nan":
-        return ""
-    parts: List[str] = []
-    for raw in re.split(r"[、,，;；|/]+", text):
-        item = raw.strip()
-        if not item or item.lower() == "nan":
-            continue
-        if item not in parts:
-            parts.append(item)
-    return "、".join(parts)
+_normalize_concepts_text = _utils_parsing.normalize_concepts_text
 
 
-def _safe_float(value: Any) -> Optional[float]:
-    try:
-        if value is None:
-            return None
-        if isinstance(value, str) and value.strip() == "":
-            return None
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+_safe_float = _utils_parsing.safe_float
 
 
-def _today_ymd() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+# 日期 / 缓存新鲜度：实现已迁移到 src/utils/cache_freshness.py
+from src.utils import cache_freshness as _cache_fresh
+_today_ymd = _cache_fresh.today_ymd
+_should_refresh_today_row = _cache_fresh.should_refresh_today_row
+_estimate_last_trade_date = _cache_fresh.estimate_last_trade_date
+_is_history_cache_fresh = _cache_fresh.is_history_cache_fresh
 
 
-def _should_refresh_today_row(df: Optional[pd.DataFrame], date_col: str = "date") -> bool:
-    if df is None or df.empty or date_col not in df.columns:
-        return False
-    latest_date = str(df[date_col].iloc[-1]).strip()
-    if latest_date != _today_ymd():
-        return False
-    now = datetime.now()
-    # 15:30 之后默认认为日线与日资金流已基本稳定，可直接复用缓存。
-    return now.hour < 15 or (now.hour == 15 and now.minute < 30)
+_build_a_share_universe = _src_universe.build_a_share_universe
 
 
-def _estimate_last_trade_date() -> str:
-    """估算最近一个交易日（不考虑节假日，仅排除周末）。
-    周一~周五 15:30 前返回上一个交易日，15:30 后返回当天。
-    周六/周日返回最近的周五。
-    """
-    now = datetime.now()
-    today = now.date()
-    weekday = today.weekday()  # 0=Mon ... 6=Sun
-    if weekday == 5:  # Saturday
-        return (today - timedelta(days=1)).strftime("%Y-%m-%d")
-    if weekday == 6:  # Sunday
-        return (today - timedelta(days=2)).strftime("%Y-%m-%d")
-    # Weekday
-    market_closed = now.hour > 15 or (now.hour == 15 and now.minute >= 30)
-    if market_closed:
-        return today.strftime("%Y-%m-%d")
-    # Market not yet closed today → last trade date is previous working day
-    if weekday == 0:  # Monday before close → Friday
-        return (today - timedelta(days=3)).strftime("%Y-%m-%d")
-    return (today - timedelta(days=1)).strftime("%Y-%m-%d")
-
-
-def _is_history_cache_fresh(
-    stock_code: str,
-    min_rows: int,
-    log: Optional[Callable[[str], None]] = None,
-) -> bool:
-    """判断本地历史缓存是否足够新鲜，可以跳过网络请求。
-
-    策略：
-    1. 读取 history_meta 表中的 refreshed_at 和 latest_trade_date
-    2. 如果 latest_trade_date >= 估算的最近交易日，并且 row_count >= min_rows → 新鲜
-    3. 如果 refreshed_at 在今天 15:30 之后 → 新鲜（当天收盘后已刷新过）
-    """
-    meta = load_history_meta_store(stock_code)
-    if meta is None:
-        return False
-    latest_td_raw = str(meta.get("latest_trade_date") or "").strip()
-    row_count = int(meta.get("row_count") or 0)
-    refreshed_at = str(meta.get("refreshed_at") or "").strip()
-    if not latest_td_raw or row_count < min_rows:
-        return False
-
-    # 统一日期格式为 YYYY-MM-DD，避免字符串比较出错
-    try:
-        # 支持多种日期格式：2024-01-15, 20240115, 2024/01/15
-        normalized = latest_td_raw.replace("/", "-").replace(".", "-")
-        if len(normalized) == 8 and normalized.isdigit():
-            latest_td = f"{normalized[:4]}-{normalized[4:6]}-{normalized[6:]}"
-        else:
-            latest_td = normalized
-    except Exception:
-        latest_td = latest_td_raw
-
-    estimated_last_td = _estimate_last_trade_date()
-
-    # 缓存的最新交易日 >= 估算的最近交易日 → 数据足够新
-    if latest_td >= estimated_last_td:
-        if log:
-            log(f"历史 {stock_code} 缓存新鲜 (latest={latest_td} >= estimated={estimated_last_td}, rows={row_count})")
-        return True
-
-    # 今天已经刷新过（收盘后），即使 latest_trade_date 较旧也信任
-    if refreshed_at:
-        try:
-            refreshed_dt = datetime.strptime(refreshed_at, "%Y-%m-%d %H:%M:%S")
-            now = datetime.now()
-            if refreshed_dt.date() == now.date() and (
-                refreshed_dt.hour > 15 or (refreshed_dt.hour == 15 and refreshed_dt.minute >= 30)
-            ):
-                if log:
-                    log(f"历史 {stock_code} 今日收盘后已刷新 (refreshed={refreshed_at}), 跳过网络请求")
-                return True
-        except (ValueError, TypeError):
-            pass
-
-    return False
-
-
-def _build_a_share_universe(log: Optional[Callable[[str], None]] = None) -> pd.DataFrame:
-    """深交所 + 上交所（含科创板）官方列表，不含北交所；少量 HTTP，无东方财富 clist 分页。"""
-    parts: List[pd.DataFrame] = []
-    tasks = [
-        (
-            "深交所 A 股",
-            lambda: ak.stock_info_sz_name_code(symbol="A股列表"),
-            {"A股代码": "code", "A股简称": "name"},
-            "深交所",
-        ),
-        (
-            "上交所主板",
-            lambda: ak.stock_info_sh_name_code(symbol="主板A股"),
-            {"证券代码": "code", "证券简称": "name"},
-            "上交所",
-        ),
-        (
-            "科创板",
-            lambda: ak.stock_info_sh_name_code(symbol="科创板"),
-            {"证券代码": "code", "证券简称": "name"},
-            "上交所",
-        ),
-    ]
-    for label, fetch, cmap, exchange in tasks:
-        try:
-            raw = _retry_ak_call(fetch)
-            if raw is None or getattr(raw, "empty", True):
-                if log:
-                    log(f"{label}: 无数据，跳过。")
-                continue
-            d = raw.rename(columns=cmap)[["code", "name"]].copy()
-            d["code"] = _norm_code_series(d["code"])
-            d["exchange"] = exchange
-            if label == "深交所 A 股":
-                d["board"] = d["code"].map(_infer_sz_board)
-            elif label == "上交所主板":
-                d["board"] = "上交所主板"
-            else:
-                d["board"] = "科创板"
-            parts.append(d)
-            if log:
-                log(f"{label}: {len(d)} 只")
-        except Exception as e:
-            if log:
-                log(f"{label} 失败: {e}（已跳过该段）")
-    if not parts:
-        return pd.DataFrame(columns=["code", "name", "exchange", "board"])
-    out = pd.concat(parts, ignore_index=True)
-    out = out.drop_duplicates(subset=["code"], keep="first").reset_index(drop=True)
-    if log:
-        log(f"合并去重后股票池共 {len(out)} 只。")
-    return out[["code", "name", "exchange", "board"]]
-
-
-
-class _LRUCache(collections.OrderedDict):
-    """简单的 LRU 缓存，超出 maxsize 时自动淘汰最旧条目。"""
-    def __init__(self, maxsize: int = 30, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._maxsize = maxsize
-
-    def __setitem__(self, key, value):
-        if key in self:
-            self.move_to_end(key)
-        super().__setitem__(key, value)
-        while len(self) > self._maxsize:
-            self.popitem(last=False)
-
-    def __getitem__(self, key):
-        value = super().__getitem__(key)
-        self.move_to_end(key)
-        return value
+from src.utils.lru_cache import LRUCache as _LRUCache
 
 
 class StockDataFetcher:

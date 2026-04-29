@@ -19,6 +19,7 @@ from src.network.host_health import (
     on_cooldown,
 )
 from src.sources._common import normalize_history_frame
+from src.sources._jsonp import strip_wrapper as _strip_jsonp_wrapper
 
 
 _REQUEST_LOCK = threading.Lock()
@@ -42,19 +43,6 @@ def stock_code(code: str) -> str:
     """搜狐用 cn_000001 或 cn_600000 的格式。"""
     c = str(code).strip().zfill(6)
     return f"cn_{c}"
-
-
-def _strip_jsonp_wrapper(text: str) -> str:
-    s = text.strip()
-    if not s:
-        return s
-    lp = s.find("(")
-    rp = s.rfind(")")
-    if lp >= 0 and rp > lp:
-        inner = s[lp + 1 : rp].strip()
-        if inner:
-            return inner
-    return s
 
 
 def fetch_hist_frame(stock_code_in: str, start_date: str, end_date: str) -> "pd.DataFrame":
