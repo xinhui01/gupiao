@@ -2010,10 +2010,22 @@ class StockFilter:
             logger.debug("北向资金加载异常: %s", exc)
             northbound_map = {}
 
+        try:
+            board_strength = self._load_industry_board_strength()
+        except Exception as exc:
+            logger.debug("板块涨跌幅加载异常: %s", exc)
+            board_strength = {}
+
         compare_context["lhb_map"] = lhb_map
         compare_context["northbound_map"] = northbound_map
+        compare_context["board_strength"] = board_strength
         if self._log:
-            self._log(f"涨停预测：龙虎榜 {len(lhb_map)} 只 / 北向 3 日榜 {len(northbound_map)} 只")
+            top_boards = sorted(board_strength.items(), key=lambda x: -x[1])[:5]
+            board_summary = "、".join(f"{k}({v:.1f}%)" for k, v in top_boards)
+            self._log(
+                f"涨停预测：龙虎榜 {len(lhb_map)} 只 / 北向 3 日榜 {len(northbound_map)} 只 / "
+                f"板块强弱榜 TOP5 {board_summary}"
+            )
 
         # 阶段3：统一预取所有需要的历史数据（一次搞定）
         if self._log:
@@ -2129,6 +2141,11 @@ class StockFilter:
             top_nb = sorted(northbound_map.items(), key=lambda x: -x[1])[:3]
             summary_lines.append(
                 f"北向 3 日加仓 TOP3：{'、'.join(f'{c}({v/1e4:.2f}亿)' for c, v in top_nb if v > 0)}"
+            )
+        if board_strength:
+            top_boards = sorted(board_strength.items(), key=lambda x: -x[1])[:5]
+            summary_lines.append(
+                f"强势板块 TOP5：{'、'.join(f'{k}({v:+.1f}%)' for k, v in top_boards)}"
             )
 
         result = {
@@ -2273,16 +2290,25 @@ class StockFilter:
         self,
         code: str,
         compare_context: Dict[str, Any],
+        *,
+        industry: str = "",
     ) -> Tuple[float, List[str]]:
-        """龙虎榜 + 北向资金加分。
+        """龙虎榜 + 北向资金 + 板块涨跌幅加分（含 LHB 解读字段细分）。
 
-        - 龙虎榜净买入 ≥ 5000 万 → +8（强游资接力）
-        - 龙虎榜净买入 > 0 → +5
-        - 龙虎榜净卖出 ≤ -3000 万 → -5（机构出货）
-        - 龙虎榜净卖出 < 0 → -2
-        - 北向 3 日加仓 ≥ 5000 万元 → +5
-        - 北向 3 日加仓 ≥ 1000 万元 → +3
-        - 北向 3 日减仓 ≤ -3000 万元 → -3
+        基础（按净买额）：
+        - ≥5000 万净买 → +8 / >0 → +5 / ≤-3000 万 → -5 / <0 → -2
+
+        解读细分（在基础之上叠加，最多 +8）：
+        - 主力做T / 营业部接力T接 → +4（强游资接力）
+        - 知名游资地区买入（西藏/宁波/上海/江苏/深圳/广东/浙江）→ +3
+        - 机构买入 ≥2 家 → +5；1 家 → +3
+        - 机构卖出 → -4
+        - 历史成功率 ≥45% → +2；<25% → -2
+        - 普通席位单独上榜 → -1（散户接力，弱信号）
+
+        北向 3 日加仓：
+        - ≥5000 万 → +5；≥1000 万 → +3；≥200 万 → +1
+        - ≤-3000 万 → -3；≤-500 万 → -1
         """
         bonus = 0.0
         reasons: List[str] = []
@@ -2303,6 +2329,43 @@ class StockFilter:
                 bonus -= 2
                 reasons.append(f"龙虎榜净卖{abs(net)/1e6:.0f}万-2")
 
+            # 解读字段细分加分（仅在主力买入主导时给正向加分）
+            jiedu_parsed = lhb.get("jiedu_parsed") or {}
+            if isinstance(jiedu_parsed, dict):
+                is_buy = jiedu_parsed.get("is_buy_dominant", False) or net > 0
+                inst_buy = int(jiedu_parsed.get("institution_buy") or 0)
+                inst_sell = int(jiedu_parsed.get("institution_sell") or 0)
+                main_t = bool(jiedu_parsed.get("main_t_trade"))
+                region = jiedu_parsed.get("hot_money_region")
+                ordinary = bool(jiedu_parsed.get("ordinary_seats_only"))
+                rate = jiedu_parsed.get("success_rate")
+
+                if is_buy and main_t:
+                    bonus += 4
+                    reasons.append("主力做T接力+4")
+                if is_buy and region:
+                    bonus += 3
+                    reasons.append(f"{region}游资买入+3")
+                if inst_buy >= 2:
+                    bonus += 5
+                    reasons.append(f"{inst_buy}家机构买入+5")
+                elif inst_buy == 1:
+                    bonus += 3
+                    reasons.append("1家机构买入+3")
+                if inst_sell >= 1:
+                    bonus -= 4
+                    reasons.append(f"{inst_sell}家机构卖出-4")
+                if isinstance(rate, (int, float)):
+                    if rate >= 45:
+                        bonus += 2
+                        reasons.append(f"历史成功率{rate:.0f}%+2")
+                    elif rate < 25:
+                        bonus -= 2
+                        reasons.append(f"历史成功率仅{rate:.0f}%-2")
+                if is_buy and ordinary and inst_buy == 0 and not main_t and not region:
+                    bonus -= 1
+                    reasons.append("普通席位接力-1")
+
         nb_change = (compare_context.get("northbound_map") or {}).get(code)
         if isinstance(nb_change, (int, float)):
             # 单位：万元（akshare "3日增持估计-市值" 接口）
@@ -2321,6 +2384,24 @@ class StockFilter:
             elif nb_change <= -500:
                 bonus -= 1
                 reasons.append(f"北向小幅减仓{abs(nb_change):.0f}万-1")
+
+        # 板块涨跌幅加分（强势板块联动）
+        board_strength = compare_context.get("board_strength") or {}
+        if industry and isinstance(board_strength, dict):
+            chg = board_strength.get(industry)
+            if isinstance(chg, (int, float)):
+                if chg >= 5.0:
+                    bonus += 6
+                    reasons.append(f"板块{industry}涨{chg:.1f}%强势+6")
+                elif chg >= 3.0:
+                    bonus += 4
+                    reasons.append(f"板块{industry}涨{chg:.1f}%+4")
+                elif chg >= 1.5:
+                    bonus += 2
+                    reasons.append(f"板块{industry}涨{chg:.1f}%+2")
+                elif chg <= -2.5:
+                    bonus -= 3
+                    reasons.append(f"板块{industry}跌{chg:.1f}%-3")
 
         return bonus, reasons
 
@@ -2544,7 +2625,9 @@ class StockFilter:
                 reasons.append(theme_reason)
 
         # 资金面：龙虎榜 + 北向 3 日加仓
-        flow_bonus, flow_reasons = self._capital_flow_bonus(rec.get("code", ""), compare_context)
+        flow_bonus, flow_reasons = self._capital_flow_bonus(
+            rec.get("code", ""), compare_context, industry=rec.get("industry", ""),
+        )
         if flow_bonus != 0:
             score += flow_bonus
             reasons.extend(flow_reasons)
@@ -2673,14 +2756,21 @@ class StockFilter:
             burst_start = max(5, t - burst_window)
             best_burst_idx = None
             best_burst_score = 0.0
+            recent_burst_ratio_20 = None
             for idx in range(burst_start, t):
                 if pd.isna(volume.iloc[idx]):
                     continue
                 prev_vol = volume.iloc[idx - 5:idx].dropna()
                 vol_ratio_i = None
+                vol_ratio_i_20 = None
                 amt_ratio_i = None
                 if not prev_vol.empty and float(prev_vol.mean()) > 0:
                     vol_ratio_i = float(volume.iloc[idx]) / float(prev_vol.mean())
+                # 20 日基准：剔除"5 日缩量后的小放量"假爆量
+                if idx >= 20:
+                    prev_vol_20 = volume.iloc[idx - 20:idx].dropna()
+                    if not prev_vol_20.empty and float(prev_vol_20.mean()) > 0:
+                        vol_ratio_i_20 = float(volume.iloc[idx]) / float(prev_vol_20.mean())
                 if not amount.empty and idx < len(amount) and not pd.isna(amount.iloc[idx]):
                     prev_amt = amount.iloc[idx - 5:idx].dropna()
                     if not prev_amt.empty and float(prev_amt.mean()) > 0:
@@ -2694,6 +2784,7 @@ class StockFilter:
                     best_burst_score = score_i
                     best_burst_idx = idx
                     recent_burst_ratio = round(vol_ratio_i, 2) if vol_ratio_i is not None else None
+                    recent_burst_ratio_20 = round(vol_ratio_i_20, 2) if vol_ratio_i_20 is not None else None
                     recent_burst_amount_ratio = round(amt_ratio_i, 2) if amt_ratio_i is not None else None
 
             if best_burst_idx is not None:
@@ -2741,6 +2832,16 @@ class StockFilter:
         if recent_burst_amount_ratio is not None and recent_burst_amount_ratio >= 2.5:
             score += 4
             reasons.append(f"额比{recent_burst_amount_ratio:.1f}x+4")
+
+        # 1b. 爆量真伪校验：5d 量比 ≥2.5 但 20d 量比 <1.0 → 调整期假爆量
+        if (
+            recent_burst_ratio is not None and recent_burst_ratio >= 2.5
+            and recent_burst_ratio_20 is not None and recent_burst_ratio_20 < 1.0
+        ):
+            score -= 8
+            reasons.append(
+                f"5d{recent_burst_ratio:.1f}x但20d仅{recent_burst_ratio_20:.1f}x假爆量-8"
+            )
 
         # 2. 距爆量天数（max 12）
         if 1 <= days_since_burst <= 2:
@@ -3715,8 +3816,8 @@ class StockFilter:
             if theme_reason:
                 reasons.append(theme_reason)
 
-        # 资金面：龙虎榜 + 北向 3 日加仓
-        flow_bonus, flow_reasons = self._capital_flow_bonus(code, compare_context)
+        # 资金面：龙虎榜 + 北向 + 板块强弱
+        flow_bonus, flow_reasons = self._capital_flow_bonus(code, compare_context, industry=industry)
         if flow_bonus != 0:
             score += flow_bonus
             reasons.extend(flow_reasons)
@@ -3813,10 +3914,73 @@ class StockFilter:
         candidates.sort(key=lambda x: -x["score"])
         return candidates[:50]
 
-    def _load_lhb_for_date(self, trade_date: str) -> Dict[str, Dict[str, float]]:
+    @staticmethod
+    def _parse_lhb_jiedu(jiedu: str) -> Dict[str, Any]:
+        """解析龙虎榜「解读」字段。
+
+        返回:
+          institution_buy: 机构买入家数
+          institution_sell: 机构卖出家数
+          main_t_trade: 是否"主力做T"
+          hot_money_region: 命中的知名游资地区（西藏/宁波/上海/江苏/深圳/广东/浙江），无则 None
+          ordinary_seats_only: 是否只是"普通席位"（弱信号）
+          top1_dominant: 是否"买一主买"（单一席位主导）
+          success_rate: 历史接力成功率 %（None=无）
+          is_buy_dominant: 整体偏买入还是卖出
+        """
+        info: Dict[str, Any] = {
+            "institution_buy": 0,
+            "institution_sell": 0,
+            "main_t_trade": False,
+            "hot_money_region": None,
+            "ordinary_seats_only": False,
+            "top1_dominant": False,
+            "success_rate": None,
+            "is_buy_dominant": False,
+        }
+        if not jiedu:
+            return info
+        import re
+        m = re.search(r"(\d+)家机构买入", jiedu)
+        if m:
+            info["institution_buy"] = int(m.group(1))
+            info["is_buy_dominant"] = True
+        m = re.search(r"(\d+)家机构卖出", jiedu)
+        if m:
+            info["institution_sell"] = int(m.group(1))
+        if "主力做T" in jiedu or "营业部接力T接" in jiedu:
+            info["main_t_trade"] = True
+            if "买入" in jiedu or "T接" in jiedu:
+                info["is_buy_dominant"] = True
+        for region in ("西藏", "宁波", "上海", "江苏", "深圳", "广东", "浙江", "北京"):
+            if region in jiedu and "买入" in jiedu and "卖出" not in jiedu.split(region, 1)[1][:20]:
+                info["hot_money_region"] = region
+                info["is_buy_dominant"] = True
+                break
+        if "普通席位" in jiedu:
+            info["ordinary_seats_only"] = True
+        if "买一主买" in jiedu:
+            info["top1_dominant"] = True
+            info["is_buy_dominant"] = True
+        m = re.search(r"成功率(\d+(?:\.\d+)?)%", jiedu)
+        if m:
+            try:
+                info["success_rate"] = float(m.group(1))
+            except ValueError:
+                pass
+        return info
+
+    def _load_lhb_for_date(self, trade_date: str) -> Dict[str, Dict[str, Any]]:
         """加载指定交易日的龙虎榜数据。
 
-        返回 dict: code → {"net_buy": 净买入额, "buy": 买入额, "sell": 卖出额, "reason": 上榜原因}
+        返回 dict: code → {
+            "net_buy": 净买入额,
+            "buy": 买入额,
+            "sell": 卖出额,
+            "reason": 上榜原因,
+            "jiedu": 解读原文,
+            "jiedu_parsed": 解析后的 dict（机构家数/游资地区/成功率等）
+        }
         网络失败/无数据返回空 dict（不阻塞预测）。
 
         缓存键: stock_filter_lhb_<trade_date>
@@ -3824,8 +3988,11 @@ class StockFilter:
         from stock_store import load_app_config, save_app_config
         cache_key = f"stock_filter_lhb_{str(trade_date).strip()}"
         cached = load_app_config(cache_key, default=None)
+        # 旧缓存里没有 jiedu_parsed，需要重建一次
         if isinstance(cached, dict) and cached:
-            return cached  # type: ignore[return-value]
+            sample = next(iter(cached.values())) if cached else None
+            if isinstance(sample, dict) and "jiedu_parsed" in sample:
+                return cached  # type: ignore[return-value]
 
         try:
             import akshare as ak
@@ -3843,7 +4010,7 @@ class StockFilter:
         if df is None or df.empty:
             return {}
 
-        result: Dict[str, Dict[str, float]] = {}
+        result: Dict[str, Dict[str, Any]] = {}
         for _, row in df.iterrows():
             try:
                 code = str(row.get("代码", "")).strip().zfill(6)
@@ -3853,15 +4020,63 @@ class StockFilter:
                 buy = float(row.get("龙虎榜买入额") or 0)
                 sell = float(row.get("龙虎榜卖出额") or 0)
                 reason = str(row.get("上榜原因") or "").strip()
-                # 同一天可能多次上榜，累加
+                jiedu = str(row.get("解读") or "").strip()
+                # 同一天可能多次上榜，累加金额并保留首次解读
                 if code in result:
                     result[code]["net_buy"] += net
                     result[code]["buy"] += buy
                     result[code]["sell"] += sell
                 else:
                     result[code] = {
-                        "net_buy": net, "buy": buy, "sell": sell, "reason": reason,
+                        "net_buy": net,
+                        "buy": buy,
+                        "sell": sell,
+                        "reason": reason,
+                        "jiedu": jiedu,
+                        "jiedu_parsed": self._parse_lhb_jiedu(jiedu),
                     }
+            except (TypeError, ValueError):
+                continue
+
+        if result:
+            try:
+                save_app_config(cache_key, result)
+            except Exception:
+                pass
+        return result
+
+    def _load_industry_board_strength(self) -> Dict[str, float]:
+        """加载东财行业板块涨跌幅，识别强势板块。
+
+        返回 dict: 行业名 → 当日涨跌幅 %
+        """
+        from stock_store import load_app_config, save_app_config
+        from datetime import datetime as _dt
+        today_key = _dt.now().strftime("%Y%m%d_%H")  # 小时级缓存（盘中变化）
+        cache_key = f"stock_filter_board_strength_{today_key}"
+        cached = load_app_config(cache_key, default=None)
+        if isinstance(cached, dict) and cached:
+            return cached  # type: ignore[return-value]
+
+        try:
+            import akshare as ak
+            from stock_data import _retry_ak_call
+            df = _retry_ak_call(ak.stock_board_industry_name_em)
+        except Exception as exc:
+            if self._log:
+                self._log(f"涨停预测：板块涨跌幅拉取失败 {exc}")
+            return {}
+
+        if df is None or df.empty:
+            return {}
+
+        result: Dict[str, float] = {}
+        for _, row in df.iterrows():
+            try:
+                name = str(row.get("板块名称", "")).strip()
+                chg = float(row.get("涨跌幅") or 0)
+                if name:
+                    result[name] = chg
             except (TypeError, ValueError):
                 continue
 
