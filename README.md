@@ -1,6 +1,6 @@
-# 股票筛选器
+# A股筛选
 
-这是一个基于 Python 的日终股票筛选工具，主要用于：
+这是一个基于 Python 的日终 A 股筛选工具，主要用于：
 
 - 扫描全量 A 股股票
 - 按你设置的条件筛选结果
@@ -178,34 +178,80 @@ pyinstaller -w -F main.py -n ashare-scan
 
 ## 项目结构
 
-顶层模块：
+顶层模块（薄 facade 居多，主要逻辑已模块化到 `src/`）：
 
 | 文件 | 说明 |
 |---|---|
 | `main.py` | 程序入口 |
-| `stock_gui.py` | 图形界面、排序、导出、详情查看 |
-| `stock_filter.py` | 筛选逻辑、放量判断、涨停判断 |
-| `stock_data.py` | 数据获取、多源切换、限流保护 |
-| `stock_store.py` | SQLite 存储层（schema / 读写 / 连接管理） |
+| `stock_gui.py` | Tkinter 图形界面（排序 / 导出 / 详情 / 取消） |
+| `stock_filter.py` | 筛选逻辑、评分、涨停预测、放量判断 |
+| `stock_data.py` | 数据抓取统一入口（facade，转发给 `src/sources/*`）+ `EODData` 主类 |
+| `stock_store.py` | SQLite 存储层（schema / 读写 / 连接管理 / 备份恢复） |
 | `stock_validator.py` | OHLC / 涨跌幅 / 交易日缺口校验 |
+| `stock_logger.py` | 统一 logging 配置 |
+| `stock_indicators.py` | 技术指标 |
+| `data_source_models.py` | 多源切换的数据类（`DataProviderPlan` 等） |
+| `llm_client.py` | NVIDIA NIM 在线推理 client |
+| `llm_theme_clustering.py` | 题材聚类 |
+| `quote_channel.py` | 行情分片占位 |
+| `scan_models.py` | 扫描相关数据类 |
 | `requirements.txt` | Python 依赖 |
 
-`src/` 下是按职责拆出的可独立测试组件：
+`src/` 按职责模块化（这一轮重构把 `stock_data.py` 从 4417 行压到约 2076 行，多出来的逻辑都搬到这里）：
 
-| 路径 | 说明 |
-|---|---|
-| `src/gui/ui_dispatch.py` | `UIDispatcher`：后台线程 → Tk 主线程的安全派发，统一处理 `_is_closing` 与 `TclError` |
-| `src/gui/log_drainer.py` | `LogDrainer`：日志队列 + 定时抽取 + 主线程直写 |
-| `src/services/db_admin_service.py` | 数据库备份 / 恢复 / 清理 / 自选股 CSV 导入导出 + `SafeRestoreOrchestrator` |
-| `src/services/history_analysis_service.py` | 历史 K 线分析（MA / 趋势 / 涨停识别 / 评分） |
-| `src/models/analysis_models.py` | 分析相关的数据类 |
-| `src/utils/cancel_token.py` | `CancelToken` + `CancelTokenRegistry`：统一的可传播取消机制 |
-| `src/utils/em_circuit_breaker.py` | 东方财富请求熔断器（连续失败指数退避） |
-| `src/utils/daemon_executor.py` | `DaemonThreadPoolExecutor`：worker 强制为 daemon 的线程池 |
-| `src/utils/snapshot_history.py` | 扫描快照相关的历史辅助 |
-| `src/utils/trade_calendar.py` | 交易日历推导 |
+```
+src/
+├── config.py                         统一 env 读取（env_int / env_float / env_bool / env_str）
+├── network/                          HTTP 网络层（跨源共用）
+│   ├── headers.py                        UA / Referer 池 + 东财随机 headers/cookie
+│   ├── proxy_pool.py                     可选免费代理池（多源拉取 + 验证 + 黑名单）
+│   └── host_health.py                    全局主机健康/冷却管理（被所有源共享）
+├── sources/                          数据源
+│   ├── _common.py                        市场前缀 / 历史 frame 标准化 / 列名匹配
+│   ├── _jsonp.py                         JSONP 回调名 + 包装剥离（跨源共用）
+│   ├── universe.py                       A 股全市场列表构建（深 + 沪含科创板）
+│   ├── tencent.py                        腾讯证券历史日线（自建直连 + akshare 回退）
+│   ├── sina.py                           新浪财经
+│   ├── netease.py                        网易财经（CSV / GBK）
+│   ├── baidu.py                          百度股市通
+│   ├── sohu.py                           搜狐财经（JSONP）
+│   ├── ths.py                            同花顺 10jqka（按年请求合并）
+│   ├── wscn.py                           华尔街见闻
+│   └── eastmoney/                    东方财富抓取链路（独立子包，依赖关系无环）
+│       ├── throttling.py                     自适应间隔 + 阻塞冷却 + 异常类 + 诊断计数
+│       ├── rate_limit.py                     限流信号检测
+│       ├── session.py                        核心 GET 包装（限流/代理/JSONP/headers 组合点）
+│       ├── history_parser.py                 request_params + parse_hist_json
+│       ├── history.py                        probe_mirror + fetch_hist_frame（顶层入口）
+│       ├── intraday.py                       盘前竞价快照 + 1min 分时 + 帧标准化/选日/切日
+│       ├── mirrors.py                        push2 多节点 URL 构造 + 健康度优先级
+│       ├── numeric.py                        行情字段还原（"元×1000" 修正）
+│       ├── akshare_patch.py                  替换 akshare 内置 request_with_retry
+│       └── akshare_warnings.py               静默 akshare concept-board 噪声警告
+├── utils/                            通用工具
+│   ├── codes.py                          股票代码 / 板块 / 交易所推断
+│   ├── parsing.py                        safe_float / 中文数字 / 概念字符串归一化 / 列名匹配
+│   ├── cache_freshness.py                今日/最近交易日估算 + 历史缓存新鲜度判定
+│   ├── lru_cache.py                      OrderedDict 实现的 LRU
+│   ├── cancel_token.py                   `CancelToken` + `CancelTokenRegistry`：统一的可传播取消机制
+│   ├── daemon_executor.py                `DaemonThreadPoolExecutor`：worker 强制为 daemon 的线程池
+│   ├── em_circuit_breaker.py             东方财富请求熔断器（连续失败指数退避）
+│   ├── trade_calendar.py                 交易日历推导
+│   └── snapshot_history.py               扫描快照相关的历史辅助
+├── services/                         业务服务
+│   ├── store_facade.py                   Store 包装层（universe / history / fund_flow 各 save+load）
+│   ├── db_admin_service.py               数据库备份 / 恢复 / 清理 / CSV 导入导出 + `SafeRestoreOrchestrator`
+│   └── history_analysis_service.py       历史 K 线分析（MA / 趋势 / 涨停识别 / 评分）
+├── gui/
+│   ├── ui_dispatch.py                    `UIDispatcher`：后台线程 → Tk 主线程的安全派发
+│   ├── log_drainer.py                    `LogDrainer`：日志队列 + 定时抽取 + 主线程直写
+│   ├── result_columns.py                 结果列定义
+│   └── result_filters.py                 结果过滤器
+└── models/
+    └── analysis_models.py                分析相关的数据类
+```
 
-老的调用方（如 `from stock_store import backup_database, restore_database`）都保留了转发壳，升级后无需改动任何业务代码。
+老的调用方（如 `from stock_data import _retry_ak_call`、`from stock_store import backup_database` 等）都保留了别名转发，升级后无需改动任何业务代码。
 
 ## 测试
 

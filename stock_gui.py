@@ -79,7 +79,7 @@ class StockMonitorApp:
     def __init__(self, root: tk.Tk):
         ensure_store_ready()
         self.root = root
-        self.root.title("日终股票筛选器")
+        self.root.title("A股筛选")
         self.root.minsize(1280, 820)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._set_initial_window_geometry()
@@ -5596,7 +5596,7 @@ class StockMonitorApp:
     def show_about(self):
         messagebox.showinfo(
             "关于",
-            "日终股票筛选器\n\n"
+            "A股筛选\n\n"
             "功能:\n"
             "- 只使用历史日线数据\n"
             "- 筛选最近N日收盘全部高于MA\n"
