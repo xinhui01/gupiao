@@ -2813,6 +2813,9 @@ class StockFilter:
             return None
         if dist_ma5_pct is None or not (-3.0 <= dist_ma5_pct <= 3.0):
             return None
+        # 收盘低于 MA5 时必须当日有触及 MA5（日内回踩才放行，避免趋势走弱）
+        if dist_ma5_pct < 0 and not touched_ma5:
+            return None
         if change_pct is None or change_pct < -5.0 or change_pct >= 6.0:
             return None
         if days_since_burst is None or days_since_burst > 7:
