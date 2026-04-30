@@ -456,9 +456,11 @@ _infer_exchange = _utils_codes.infer_exchange
 
 _infer_market = _sources_common.infer_market
 _market_prefixed_code = _sources_common.market_prefixed_code
+_first_existing_column = _sources_common.first_existing_column
 
 
 _normalize_concepts_text = _utils_parsing.normalize_concepts_text
+_find_fund_flow_column = _utils_parsing.find_fund_flow_column
 
 
 _safe_float = _utils_parsing.safe_float
